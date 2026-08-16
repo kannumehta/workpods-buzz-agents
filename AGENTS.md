@@ -10,6 +10,12 @@ The live machine-local env files and generated Nostr keys live under:
 Do not commit generated keys, service env files, auth tokens, logs, or runtime
 state. Keep agent source changes in `buzz-source` and runner changes here.
 
+## Multi-Agent Collaboration
+
+This is a multi-agent collaboration project. Agents must always prefer a git
+worktree and a new branch for repository work, and use issues to track
+non-trivial tasks, coordination points, and follow-up work.
+
 The deployed identities are intentionally stable:
 
 ```text
