@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p "${HOME}/.config/systemd/user"
+cp /home/ubuntu/workpods-umbrella/workpods-buzz-agents/systemd/workpods-buzz-agent@.service \
+  "${HOME}/.config/systemd/user/workpods-buzz-agent@.service"
+systemctl --user daemon-reload
+

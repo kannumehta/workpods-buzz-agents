@@ -1,0 +1,18 @@
+[Unit]
+Description=WorkPods Buzz ACP agent (%i)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/workpods-umbrella
+Environment=PATH=/home/ubuntu/workpods-umbrella/.runtime/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGENT_CWD=/home/ubuntu/workpods-umbrella
+Environment=BUZZ_ACP_SYSTEM_PROMPT_FILE=/home/ubuntu/workpods-umbrella/workpods-buzz-agents/prompts/base.md
+EnvironmentFile=/home/ubuntu/workpods-umbrella/.runtime/secrets/buzz-agents/%i.env
+ExecStart=/home/ubuntu/workpods-umbrella/.runtime/bin/buzz-acp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

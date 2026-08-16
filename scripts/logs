@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+agent="${1:-claude}"
+journalctl --user -u "workpods-buzz-agent@${agent}.service" -f
+
