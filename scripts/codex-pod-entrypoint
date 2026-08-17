@@ -72,9 +72,15 @@ if has_server workpods-email-management; then
   require_env EMAIL_MANAGEMENT_MCP_BEARER_TOKEN
 fi
 
-mkdir -p "${CODEX_HOME}" "${APP_SERVER_LOGS}" "${workspace}/.agents" "$(dirname "${system_prompt}")"
-ln -sfnT "${pod_root}/skills" "${workspace}/.agents/skills"
-ln -sfnT "${pod_root}/skills" "${CODEX_HOME}/skills"
+mkdir -p "${CODEX_HOME}" "${APP_SERVER_LOGS}" "${workspace}" "$(dirname "${system_prompt}")"
+for legacy_skill_path in "${workspace}/.agents/skills" "${CODEX_HOME}/skills"; do
+  if [ -L "${legacy_skill_path}" ]; then
+    unlink "${legacy_skill_path}"
+  elif [ -e "${legacy_skill_path}" ]; then
+    echo "unexpected legacy skill path is not a symlink: ${legacy_skill_path}" >&2
+    exit 65
+  fi
+done
 
 {
   cat "${pod_base}/common/system-prefix.md"
@@ -96,6 +102,8 @@ config_tmp="${CODEX_HOME}/config.toml.tmp"
   printf 'sandbox_mode = "workspace-write"\n'
   printf '\n[sandbox_workspace_write]\n'
   printf 'network_access = true\n'
+  printf '\n[skills.bundled]\n'
+  printf 'enabled = false\n'
 
   if has_server workpods; then
     printf '\n[mcp_servers.workpods]\n'

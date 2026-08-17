@@ -8,98 +8,33 @@ permission_mode = "auto"
 display_name = "WorkPods Pod"
 workpods_tool_profile = "internal-workpod;admin"
 mcp_servers = ["workpods"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "baseline-synthesis",
-  "enrichment-final-synthesis",
-  "insight-action-planning",
-]
 
 [pods.geo-pod]
 display_name = "WorkPods GEO Pod"
 workpods_tool_profile = "internal-geo;admin"
 mcp_servers = ["workpods", "composio", "workpods-semrush-mcp"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "playwright-browser",
-  "baseline-market-position",
-  "baseline-competitor-map",
-  "baseline-search-market",
-  "baseline-prompt-program",
-  "enrichment-competitor-expansion",
-  "enrichment-prompt-universe",
-  "enrichment-answer-scan-submit",
-  "enrichment-answer-analysis",
-  "competitor-discovery",
-  "competitor-intelligence",
-  "prompt-universe-design",
-  "answer-engine-scan-execution",
-  "answer-observation-analysis",
-  "answer-mention-competitor-promotion",
-  "semrush-ai-visibility",
-  "authority-backlink-intelligence",
-]
 
 [pods.content-pod]
 display_name = "WorkPods Content Pod"
 workpods_tool_profile = "internal-content;admin"
 mcp_servers = ["workpods", "workpods-semrush-mcp"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "playwright-browser",
-  "baseline-brand-foundation",
-  "baseline-brand-evidence",
-  "enrichment-site-inventory",
-  "enrichment-offering-catalog",
-  "enrichment-content-strategy",
-  "domain-brand-discovery",
-  "website-inventory",
-  "product-service-catalog",
-  "content-cluster-mapping",
-]
 
 [pods.performance-pod]
 display_name = "WorkPods Performance Pod"
 workpods_tool_profile = "internal-performance;admin"
 mcp_servers = ["workpods", "composio", "workpods-semrush-mcp", "workpods-pagespeed-mcp"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "playwright-browser",
-  "baseline-technical-discoverability",
-  "enrichment-pagespeed-audit",
-  "enrichment-search-performance",
-  "enrichment-technical-audit",
-  "seo-search-performance",
-  "technical-site-audit",
-  "paid-media-sync",
-  "semrush-ai-visibility",
-]
 
 [pods.lifecycle-pod]
 display_name = "WorkPods Lifecycle Pod"
 workpods_tool_profile = "internal-lifecycle;admin"
 mcp_servers = ["workpods", "composio"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "playwright-browser",
-  "baseline-conversion-path",
-  "enrichment-lifecycle-gaps",
-  "lifecycle-attribution-sync",
-]
 
 [pods.marketing-pod]
 display_name = "WorkPods Marketing Pod"
 workpods_tool_profile = "internal-workpod;internal-content;internal-geo;internal-performance;internal-lifecycle;admin"
 mcp_servers = ["workpods", "composio", "workpods-email-management"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-  "insight-action-planning",
-]
 
 [pods.support-desk-pod]
 display_name = "WorkPods Support Desk Pod"
 workpods_tool_profile = "support;support-admin;admin"
 mcp_servers = ["workpods"]
-skills = [
-  "workpods-mcp-access-diagnostics",
-]

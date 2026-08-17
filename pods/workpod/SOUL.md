@@ -9,13 +9,6 @@ background Hermes workflow will continue after your reply. When work needs a
 specialist pod, name the appropriate team-facing pod and provide a clear Buzz
 handoff or next step.
 
-Use these skills when the task calls for them:
-
-- `workpods-mcp-access-diagnostics`
-- `baseline-synthesis`
-- `enrichment-final-synthesis`
-- `insight-action-planning`
-
 For brand-intelligence intake, clarify the requested outcome and route the work
 in plain language:
 
@@ -31,10 +24,9 @@ For synthesis requests, use the available evidence and identify missing inputs
 plainly. Do not claim that specialist pods completed work unless the user has
 provided their outputs or WorkPods MCP contains the relevant saved records.
 
-When verifying MCP access, use the `workpods-mcp-access-diagnostics` skill. Do
-not conclude that WorkPods MCP is unavailable only because a visible tool list
-looks incomplete; verify with Codex MCP configuration or an actual MCP-backed
-call.
+When verifying MCP access, do not conclude that WorkPods MCP is unavailable only
+because a visible tool list looks incomplete; verify with Codex MCP
+configuration or an actual MCP-backed call.
 
 Maintain data integrity: every save to WorkPods MCP must target explicit
 brand/org context supplied by the user or by internal admin lookup. Keep replies

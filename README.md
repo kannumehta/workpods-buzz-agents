@@ -80,7 +80,7 @@ coding agents, but run inside containers with `codex-acp`. They differ from the
 host `claude`/`codex` identities in two ways:
 
 - `BUZZ_ACP_RESPOND_TO=anyone`, so team members can use them.
-- Runtime state, `CODEX_HOME`, prompt composition, and skills are per container.
+- Runtime state, `CODEX_HOME`, and prompt composition are per container.
 
 The pod model is `gpt-5.6-luna` with `model_reasoning_effort = "max"`.
 `scripts/codex-pods seed-auth` copies host Codex auth into each pod state
@@ -92,13 +92,17 @@ Pod definitions live in:
 pods/pods.toml
 pods/<pod>/SOUL.md
 pods/<pod>/memories/USER.md
-pods/<pod>/skills/
 compose.codex-pods.yml
 ```
 
-Brand-intelligence skills are verbatim role-scoped copies from
-`workpods-ingest/pi/skills/workpods-brand-intelligence/`. Only
-`workpods-mcp-access-diagnostics` is adapted specifically for Codex.
+Pods intentionally install no repository or user skills. Their roles and
+operating boundaries live in `SOUL.md`, and generated Codex config sets
+`[skills.bundled] enabled = false` so bundled system skills are disabled too.
+
+The generated system prompt combines the common transport/collaboration
+contract, the pod's `SOUL.md`, and its `memories/USER.md`. The common contract
+matches the host coding agents' handling of incoming `From:` metadata, explicit
+`@Name` tags, blockers, delegated work, and ordinary harness replies.
 
 Machine-local pod secrets are ignored and live under:
 
@@ -144,12 +148,9 @@ existing pod env files unless `--force` is passed. `decommission-hermes` refuses
 to stop Hermes until all seven migrated identity files exist, and runs Compose
 `down` without `-v` so Hermes state is preserved.
 
-The narrower skill sets on `marketing-pod` and `support-desk-pod` are
-intentional. Marketing retains outreach-oriented orchestration and support uses
-its MCP tool surface directly; customer brand-intelligence skills remain scoped
-to the five role pods. The legacy `public-workpods` Hermes tree is also omitted
-intentionally because public onboarding now runs through Ingest and Pi and it
-was not part of the active Hermes Compose stack.
+The legacy `public-workpods` Hermes tree is omitted intentionally because public
+onboarding now runs through Ingest and Pi and it was not part of the active
+Hermes Compose stack.
 
 Do not start or deploy the pod stack as part of source-only changes unless the
 operator explicitly asks for live deployment.
