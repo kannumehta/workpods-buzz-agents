@@ -39,17 +39,21 @@ runtime env files. It derives those paths from the current umbrella layout, so
 symlinked service checkouts are exposed to ACP sessions without committing
 machine-specific absolute paths.
 
+The service disables the compiled Buzz platform prompt and strips `BUZZ_*`
+environment variables before spawning Claude/Codex. The chat platform is only
+transport for these coding agents.
+
 Session controls are per Buzz channel:
 
 ```text
 @claude /model sonnet
-@claude /mode dontAsk
+@claude /mode auto
 @codex /model gpt-5.5
 @codex /mode plan
 @claude /session
 @claude /reset-session
 ```
 
-The default permission mode is `plan`. Use `/mode dontAsk` only for a channel
-session where Musketeer explicitly wants the agent to execute without approval
-prompts.
+The client-facing permission modes are `plan`, `auto`, and `edit`. The default
+permission mode is `plan`. Use `/mode auto` only for a channel session where
+Musketeer explicitly wants the agent to execute without approval prompts.
