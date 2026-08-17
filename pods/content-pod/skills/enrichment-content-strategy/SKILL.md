@@ -9,21 +9,26 @@ Use after site inventory, offering catalog, and prompt universe are available. D
 
 ## Inputs
 
-Use site inventory, offering catalog, prompt universe, tracked topics/queries, owned pages, and baseline synthesis.
+Expect compact site inventory, normalized offering catalog, prompt universe handoff, tracked topics/queries, owned page ids, baseline synthesis, and optional answer-analysis gaps if available.
 
-## Source Priority
+## WorkPods Reads
 
-1. Owned pages and product/category pages.
-2. Tracked prompts and keyword/query topics.
-3. Competitor/content gap evidence from search results or available SEO data.
+Read brand pages, page attributes, products/offers, content clusters, content cluster terms, tracked topics/queries, tracked prompt queries, competitors, findings, and prior recommendations.
 
 ## Procedure
 
-1. Create or update content clusters that match the brand's real offers and customer intents.
-2. Link relevant terms/prompts to clusters and assign pages to clusters where ids/URLs are known.
-3. Identify content gaps that block answer visibility, citations, or conversion.
-4. Persist content recommendations and findings with evidence.
-5. Do not invent future pages without clearly marking them as recommendations.
+1. Create or update content clusters that match real offers, customer intents, tracked topics, and prompt themes.
+2. Link relevant terms/prompts to clusters and assign existing pages to clusters where ids/URLs are known.
+3. Identify content gaps blocking answer visibility, citations, category coverage, comparison coverage, or conversion.
+4. Persist content recommendations and findings with evidence from supplied inventory/offering/prompt handoffs.
+5. Reconcile clusters, linked terms, page assignments, gaps found, recommendations persisted, skipped duplicates, and receipts.
+6. If prompt universe or catalog evidence is partial, produce a supported subset and call out missing inputs.
+
+## Do Not
+
+- Do not browse or search for extra content ideas.
+- Do not run technical audits or answer observation analysis.
+- Do not invent future pages as facts; mark them as recommendations.
 
 ## Required Output Fields
 
@@ -38,4 +43,4 @@ Return the common JSON envelope plus:
 
 ## Handoff
 
-Include clusters, page coverage gaps, recommended content briefs, and evidence references.
+Include clusters, assigned pages, linked terms/prompts, content gaps, recommended briefs, evidence references, count reconciliation, receipts, and final-synthesis priorities.

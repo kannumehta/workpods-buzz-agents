@@ -5,32 +5,40 @@ description: Use only for the baseline brand-evidence step: identify the brand f
 
 ## When To Use
 
-Use for `baseline-brand-evidence` after preflight has resolved the submitted domain and canonical URL. Do not do full site inventory, competitor research, technical audit, or lifecycle analysis.
+Use only for `baseline-brand-evidence` after Ingest preflight has resolved the submitted domain and canonical URL and supplied compact `site_evidence`.
 
 ## Inputs
 
-Use `brand_id`, `domain`, `canonical_url`, and the `baseline-preflight` handoff. If canonical URL is unavailable, try the submitted domain directly and report the limitation.
+Expect these direct predecessor categories in `inputs`:
 
-## Source Priority
+- `preflight`: submitted domain, canonical URL, redirect notes, reachability status.
+- `site_evidence`: compact homepage/about/navigation/contact/product/service evidence with source URLs, titles, snippets, schema hints, and extraction limits.
+- Optional existing baseline context from WorkPods.
 
-1. Brand homepage and linked about/contact/product/service/category pages.
-2. Structured page metadata, visible navigation, footer, and schema data.
-3. Search/web research only to resolve brand identity ambiguity.
+If `site_evidence` is absent or too thin, read existing scoped WorkPods brand/page/product records and return partial status. Do not fetch pages yourself.
 
-Do not invent facts that are not visible or strongly evidenced.
+## WorkPods Reads
+
+Read the brand, existing brand documents/facts, brand pages, products/offers, and prior onboarding notes when available. Use reads to avoid duplicates and preserve existing facts that are better supported than the new packet.
 
 ## Procedure
 
-1. Confirm the brand name, aliases, homepage URL, one-line description, industry/category, product type, primary country/market, and geography.
-2. Inspect only the homepage and a bounded set of obvious high-value pages linked from navigation.
-3. Identify owned pages worth registering: homepage, category/service/product pages, about/contact, pricing, key landing pages.
-4. Identify obvious products/offers with names, category, short description, page URL, and price text when visible.
-5. Persist only brand profile, owned pages, products/offers, and a compact brand evidence note/document if available.
-6. Keep receipts compact. If a write tool is unavailable, mark the affected status as `BLOCKED` and explain.
+1. Establish evidenced brand identity: display name, aliases, canonical URL, category, audience, geography, value proposition, core offering hints, and owned identity pages.
+2. Separate durable facts from weak hints. Persist only facts supported by `site_evidence` or existing WorkPods records.
+3. Register a bounded owned identity page set: homepage, about/contact, core category/service/product entry pages, pricing if supplied, and key conversion pages when evidenced.
+4. Persist initial offering facts only when names/categories are directly evidenced. This is not the complete catalog.
+5. Reconcile duplicates against existing pages/products by canonical URL, normalized name, and source URL.
+6. Count discovered, selected, persisted, skipped-duplicate, and skipped-insufficient-evidence records.
+7. Return `INSUFFICIENT_DATA` for thin evidence, `PARTIAL`/equivalent notes for partial persistence, and `BLOCKED` only when required writes cannot be attempted.
+
+## Do Not
+
+- Do not browse, crawl, map the full site, independently search the web, or call Browse directly.
+- Do not overwrite established brand facts with weaker snippets.
+- Do not produce a complete product/service catalog; leave that to `enrichment-offering-catalog`.
+- Do not create competitor, technical, prompt, or lifecycle records.
 
 ## Required Output Fields
-
-Return the common JSON envelope plus:
 
 - `brand_profile_status`
 - `brand_profile_receipts`
@@ -48,4 +56,4 @@ If persisted count is lower than found count, include `owned_pages_not_persisted
 
 ## Handoff
 
-Include compact brand name, aliases, canonical URL, primary categories, products/offers, geography, and evidence URLs.
+Include compact brand name, aliases, canonical URL, category, audience, geography, core offering hints, selected identity page URLs, product/service hints, evidence URLs, count reconciliation, persistence receipts, and open gaps for competitor/search/prompt downstream steps.

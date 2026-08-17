@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+umbrella_root="${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}"
+hermes_root="${WORKPODS_HERMES_ROOT:-${umbrella_root}/buzz-deploy/hermes}"
+target_root="${WORKPODS_CODEX_POD_SECRETS_ROOT:-${umbrella_root}/.runtime/secrets/buzz-agents/pods}"
+
+pods=(
+  workpod
+  geo-pod
+  content-pod
+  performance-pod
+  lifecycle-pod
+  marketing-pod
+  support-desk-pod
+)
+
+declare -A identity_files=(
+  [workpod]="${hermes_root}/agents/internal-workpods/profiles/workpod/.env"
+  [geo-pod]="${hermes_root}/agents/internal-workpods/profiles/geo-pod/.env"
+  [content-pod]="${hermes_root}/agents/internal-workpods/profiles/content-pod/.env"
+  [performance-pod]="${hermes_root}/agents/internal-workpods/profiles/performance-pod/.env"
+  [lifecycle-pod]="${hermes_root}/agents/internal-workpods/profiles/lifecycle-pod/.env"
+  [marketing-pod]="${hermes_root}/secrets/marketing-pod.env"
+  [support-desk-pod]="${hermes_root}/secrets/support-desk-pod.env"
+)
+
+declare -A tool_profiles=(
+  [workpod]="internal-workpod;admin"
+  [geo-pod]="internal-geo;admin"
+  [content-pod]="internal-content;admin"
+  [performance-pod]="internal-performance;admin"
+  [lifecycle-pod]="internal-lifecycle;admin"
+  [marketing-pod]="internal-workpod;internal-content;internal-geo;internal-performance;internal-lifecycle;admin"
+  [support-desk-pod]="support;support-admin;admin"
+)
+
+read_assignment() {
+  local file="$1"
+  local key="$2"
+  local assignment
+
+  if ! assignment="$(sudo awk -v key="${key}" '
+    index($0, key "=") == 1 { print; found = 1; exit }
+    END { if (!found) exit 1 }
+  ' "${file}")"; then
+    echo "missing ${key} in Hermes source: ${file}" >&2
+    return 1
+  fi
+  if [ "${assignment}" = "${key}=" ]; then
+    echo "empty ${key} in Hermes source: ${file}" >&2
+    return 1
+  fi
+  printf '%s\n' "${assignment}"
+}
+
+cleanup_staging() {
+  local pod
+
+  if [ -z "${staging:-}" ] || [ ! -d "${staging}" ]; then
+    return
+  fi
+  for pod in "${pods[@]}"; do
+    if [ -e "${staging}/${pod}.env" ]; then
+      unlink "${staging}/${pod}.env"
+    fi
+  done
+  rmdir "${staging}"
+}
+
+validate_target() {
+  local pod="$1"
+  local target="${target_root}/${pod}.env"
+  local key
+  local required_keys=(BUZZ_RELAY_URL BUZZ_PRIVATE_KEY WORKPODS_MCP_TOKEN WORKPODS_MCP_TOOL_PROFILE)
+
+  if [ ! -f "${target}" ]; then
+    echo "missing migrated pod env: ${target}" >&2
+    return 1
+  fi
+  case "${pod}" in
+    geo-pod|performance-pod|lifecycle-pod|marketing-pod)
+      required_keys+=(COMPOSIO_API_KEY COMPOSIO_MCP_URL)
+      ;;
+  esac
+  if [ "${pod}" = performance-pod ]; then
+    required_keys+=(PAGESPEED_MCP_BEARER_TOKEN)
+  fi
+  if [ "${pod}" = marketing-pod ]; then
+    required_keys+=(EMAIL_MANAGEMENT_MCP_BEARER_TOKEN)
+  fi
+
+  for key in "${required_keys[@]}"; do
+    if ! awk -v key="${key}" '
+      index($0, key "=") == 1 {
+        value = substr($0, length(key) + 2)
+        gsub(/^"|"$/, "", value)
+        if (value != "" && value !~ /^REPLACE_WITH_/) found = 1
+      }
+      END { exit !found }
+    ' "${target}"; then
+      echo "missing or placeholder ${key} in migrated pod env: ${target}" >&2
+      return 1
+    fi
+  done
+  if [ $((8#$(stat -c '%a' "${target}") & 8#077)) -ne 0 ]; then
+    echo "pod env is readable beyond owner: ${target}" >&2
+    return 1
+  fi
+}
+
+prepare() {
+  local force=false
+  local staging
+
+  if [ "${1:-}" = "--force" ]; then
+    force=true
+    shift
+  fi
+  if [ "$#" -ne 0 ]; then
+    echo "usage: $0 prepare [--force]" >&2
+    return 2
+  fi
+
+  if [ "${force}" != true ]; then
+    for pod in "${pods[@]}"; do
+      if [ -e "${target_root}/${pod}.env" ]; then
+        echo "target already exists: ${target_root}/${pod}.env (use --force to replace all pod env files)" >&2
+        return 1
+      fi
+    done
+  fi
+
+  staging="$(mktemp -d)"
+  trap cleanup_staging EXIT
+  umask 077
+
+  for pod in "${pods[@]}"; do
+    {
+      read_assignment "${identity_files[$pod]}" BUZZ_RELAY_URL
+      read_assignment "${identity_files[$pod]}" BUZZ_PRIVATE_KEY
+      read_assignment "${hermes_root}/secrets/workpods-mcp.env" WORKPODS_MCP_TOKEN
+      printf 'WORKPODS_MCP_TOOL_PROFILE="%s"\n' "${tool_profiles[$pod]}"
+
+      case "${pod}" in
+        geo-pod|performance-pod|lifecycle-pod|marketing-pod)
+          read_assignment "${hermes_root}/secrets/composio.env" COMPOSIO_API_KEY
+          read_assignment "${identity_files[$pod]}" COMPOSIO_MCP_URL
+          ;;
+      esac
+      if [ "${pod}" = performance-pod ]; then
+        read_assignment "${hermes_root}/secrets/pagespeed-mcp.env" PAGESPEED_MCP_BEARER_TOKEN
+      fi
+      if [ "${pod}" = marketing-pod ]; then
+        read_assignment "${hermes_root}/secrets/email-management-mcp.env" EMAIL_MANAGEMENT_MCP_BEARER_TOKEN
+      fi
+    } > "${staging}/${pod}.env"
+  done
+
+  mkdir -p "${target_root}"
+  chmod 0700 "${target_root}"
+  for pod in "${pods[@]}"; do
+    install -m 0600 "${staging}/${pod}.env" "${target_root}/${pod}.env"
+    echo "${pod}: prepared existing Buzz identity"
+  done
+  cleanup_staging
+  trap - EXIT
+}
+
+decommission() {
+  if [ "$#" -ne 0 ]; then
+    echo "usage: $0 decommission" >&2
+    return 2
+  fi
+  for pod in "${pods[@]}"; do
+    validate_target "${pod}"
+  done
+  if ! sudo test -f "${hermes_root}/compose.hermes.yml"; then
+    echo "missing Hermes Compose file: ${hermes_root}/compose.hermes.yml" >&2
+    return 1
+  fi
+
+  sudo docker compose -f "${hermes_root}/compose.hermes.yml" down
+  echo "Hermes pod containers are decommissioned; volumes and source state were not removed."
+}
+
+case "${1:-}" in
+  prepare)
+    shift
+    prepare "$@"
+    ;;
+  decommission)
+    shift
+    decommission "$@"
+    ;;
+  *)
+    echo "usage: $0 <prepare [--force]|decommission>" >&2
+    exit 2
+    ;;
+esac

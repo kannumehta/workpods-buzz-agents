@@ -5,31 +5,37 @@ description: Use only for the baseline competitor-map step: discover competitors
 
 ## When To Use
 
-Use for `baseline-competitor-map` after preflight and preferably with brand-evidence context. This step exists so prompt generation can depend on tiered competitors.
+Use only for `baseline-competitor-map` after brand evidence is available and Ingest has supplied Browse-generated competitor candidates.
 
 ## Inputs
 
-Use `brand_id`, `domain`, `canonical_url`, preflight handoff, and brand-evidence handoff when available.
+Expect these direct predecessor categories:
 
-## Source Priority
+- `brand_evidence`: brand name, category, offering hints, audience, geography, canonical URL.
+- `competitor_candidates`: compact candidate list from Browse/Ingest with names, domains, evidence URLs, snippets, source type, rank/confidence, and retrieval limits.
+- Existing WorkPods competitor records and baseline map when present.
 
-1. Competitors visible on search results for the brand's core category/geography.
-2. Alternatives/comparison pages and marketplace/category lists.
-3. Semrush or other SEO suite data when available.
-4. Brand-provided or already saved competitors from scoped WorkPods reads.
+## WorkPods Reads
+
+Read existing competitors, competitor intelligence, brand facts, tracked topics if present, and prior competitor map documents. Use reads for dedupe, tier preservation, and idempotent updates.
 
 ## Procedure
 
-1. Find direct competitors with overlapping offerings, geography, and customer intent.
-2. Persist all useful competitors with name, domain, website URL, country, and short positioning summary.
-3. Assign up to 4 primary competitors: closest substitutes or most important rivals for answer visibility.
-4. Assign secondary competitors for adjacent or less direct competitors.
-5. Persist competitor intelligence when evidence supports it: target customer, pricing model, distribution model, strengths, weaknesses, gaps, differentiators.
-6. Do not include directories, media sites, generic marketplaces, or unrelated brands unless they genuinely compete for the customer decision.
+1. Normalize candidate names/domains and merge duplicates with existing competitors.
+2. Decide whether each candidate is direct, adjacent, citation/domain-of-interest, or reject. Direct competitors share category, audience, geography, and buyer intent.
+3. Assign up to 4 primary competitors and a bounded secondary set. Preserve existing valid primary tiers unless new evidence is stronger.
+4. Persist competitors and tier rationale with evidence URLs and short positioning notes.
+5. Persist competitor intelligence only when evidence supports it: target customer, pricing/distribution hints, strengths, weaknesses, gaps, differentiators.
+6. Reconcile found, selected, persisted, primary, secondary, duplicate, and rejected counts.
+7. Report insufficient or partial evidence without failing the whole run; a small high-confidence competitor set is acceptable.
+
+## Do Not
+
+- Do not independently search the web, browse competitor sites, or widen the candidate set beyond supplied evidence and assigned Semrush reads.
+- Do not include directories, publishers, marketplaces, or review sites as competitors unless the evidence shows they compete for the same decision.
+- Do not replace baseline tiers with weaker evidence or invent positioning.
 
 ## Required Output Fields
-
-Return the common JSON envelope plus:
 
 - `competitor_map_status`
 - `competitors_found_count`
@@ -43,4 +49,4 @@ If persisted count is lower than found count, include `competitors_not_persisted
 
 ## Handoff
 
-Include primary and secondary competitor names/domains, tier rationale, and evidence URLs.
+Include primary and secondary competitor names/domains/ids, direct versus adjacent rationale, rejected-candidate caveats, evidence URLs, count reconciliation, receipts, and prompt/search implications.

@@ -96,6 +96,10 @@ pods/<pod>/skills/
 compose.codex-pods.yml
 ```
 
+Brand-intelligence skills are verbatim role-scoped copies from
+`workpods-ingest/pi/skills/workpods-brand-intelligence/`. Only
+`workpods-mcp-access-diagnostics` is adapted specifically for Codex.
+
 Machine-local pod secrets are ignored and live under:
 
 ```text
@@ -116,6 +120,36 @@ Useful pod commands:
 ./scripts/codex-pods start
 ./scripts/codex-pods status
 ```
+
+The first production migration must reuse the existing Hermes Buzz private keys;
+creating replacement keys would create new agent identities. Roll out in this
+order:
+
+```bash
+# 1. Merge and check out this repository's Codex pod change first.
+./scripts/codex-pods validate
+./scripts/codex-pods migrate-hermes-identities
+./scripts/codex-pods seed-auth
+
+# 2. Merge and check out the umbrella services change second.
+./scripts/codex-pods decommission-hermes
+cd /home/ubuntu/workpods-umbrella
+./workpodsctl deploy buzz-agents
+```
+
+`migrate-hermes-identities` reads the seven existing private keys and the MCP
+credentials they need from ignored live Hermes files, then writes owner-only pod
+env files under `.runtime/`. It never prints secret values and refuses to replace
+existing pod env files unless `--force` is passed. `decommission-hermes` refuses
+to stop Hermes until all seven migrated identity files exist, and runs Compose
+`down` without `-v` so Hermes state is preserved.
+
+The narrower skill sets on `marketing-pod` and `support-desk-pod` are
+intentional. Marketing retains outreach-oriented orchestration and support uses
+its MCP tool surface directly; customer brand-intelligence skills remain scoped
+to the five role pods. The legacy `public-workpods` Hermes tree is also omitted
+intentionally because public onboarding now runs through Ingest and Pi and it
+was not part of the active Hermes Compose stack.
 
 Do not start or deploy the pod stack as part of source-only changes unless the
 operator explicitly asks for live deployment.

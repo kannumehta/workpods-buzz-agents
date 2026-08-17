@@ -77,9 +77,20 @@ triggering message.
 - Keep `gpt-5.6-luna` and `model_reasoning_effort = "max"` in generated Codex
   config unless a future issue changes the model policy.
 - Keep pod skills structurally scoped under `pods/<pod>/skills/`.
+- Keep WorkPods brand-intelligence skills as verbatim copies of
+  `workpods-ingest/pi/skills/workpods-brand-intelligence/`. The
+  `workpods-mcp-access-diagnostics` skill is the only intentional Codex-specific
+  adaptation.
 - Do not add Hermes or Kanban runtime dependencies. Archived Hermes patches may
   live in `workpods-buzz`, but the active pod path is Codex + `buzz-acp`.
 - Seed Codex auth by copying into each pod state directory; do not mount the
   host `~/.codex` read-only into the containers.
+- Preserve the seven existing Hermes Buzz identities during the first rollout.
+  Run `migrate-hermes-identities` before `decommission-hermes`; never run both
+  runtimes concurrently with the same identities.
+- Merge the `workpods-buzz-agents` pod change before the umbrella manifest change
+  so the new Compose path exists when `buzz-agents` becomes deployable.
+- Keep `marketing-pod` and `support-desk-pod` skill sets role-specific. The
+  inactive legacy `public-workpods` Hermes profile is not a Codex pod.
 - Run `./scripts/codex-pods validate` after changing pod manifests, prompts,
   Compose, or skill sets.

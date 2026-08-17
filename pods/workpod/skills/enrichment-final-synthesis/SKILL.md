@@ -5,19 +5,30 @@ description: Use only for final enrichment synthesis: reconcile enrichment outpu
 
 ## When To Use
 
-Use after enrichment specialist steps finish or are explicitly skipped. Do not rerun specialist work except for a small read needed to resolve a contradiction.
+Use after enrichment specialist steps finish, fail, time out, or are explicitly skipped. Consume direct-edge handoffs only.
 
 ## Inputs
 
-Use direct handoffs from site inventory, offering catalog, PageSpeed audit, technical audit, competitor expansion, prompt universe, answer analysis, content strategy, and lifecycle gaps.
+Expect handoffs from site inventory, offering catalog, PageSpeed audit, search performance, technical audit, competitor expansion, prompt universe, answer scan submit/wait, answer analysis, content strategy, and lifecycle gaps. Some branches may be missing or insufficient.
+
+## WorkPods Reads
+
+Read brand overview, brand documents/context packets, pages, products, competitors, topics, prompt queries, answer analyses, visibility metrics, page quality rows, site issues, content clusters, lifecycle findings, existing findings, and recommendations. Use reads only to reconcile and verify persisted state.
 
 ## Procedure
 
 1. Reconcile all enrichment findings into a final brand context packet.
 2. Identify the highest-impact opportunities across GEO visibility, content, technical health, and lifecycle conversion.
 3. Persist final synthesis/context and findings/recommendations when available.
-4. Be explicit about missing connected data, incomplete scans, unreachable pages, or low-confidence assumptions.
-5. Keep the summary client-facing and operational.
+4. Explicitly tolerate skipped, failed, timed-out, partial, and insufficient-data branches; state practical impact and next-best follow-up.
+5. Reconcile upstream discovered/persisted/receipt counts and flag mismatches that affect confidence.
+6. Keep the summary client-facing and operational.
+
+## Do Not
+
+- Do not rerun specialist research, browse, crawl, or call Browse directly.
+- Do not mention Browse, Firecrawl, Pi, MCP, tokens, prompts, or internal implementation details in client-facing `summary` or `description`.
+- Do not hide unavailable connected data or incomplete scans.
 
 ## Required Output Fields
 
@@ -31,4 +42,4 @@ Return the common JSON envelope plus:
 
 ## Handoff
 
-Include final priorities, durable record ids, unresolved blockers, and recommended follow-up workflows.
+Include final priorities, durable record ids, unresolved blockers, skipped/failed/partial branch effects, count reconciliation, receipts, and recommended follow-up workflows.

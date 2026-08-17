@@ -5,24 +5,30 @@ description: Use only for enrichment technical audit: persist deeper site issues
 
 ## When To Use
 
-Use after site inventory and PageSpeed audit. Do not create content strategy or lifecycle recommendations here unless they are direct consequences of technical blockers.
+Use after site inventory and PageSpeed audit. Consume compact site inventory and PageSpeed evidence; do not perform broad discovery.
 
 ## Inputs
 
-Use site inventory, PageSpeed audit handoff, canonical URL, owned page reads, and available crawler/search data.
+Expect site inventory page groups/attributes, PageSpeed audit handoff, canonical URL, PageSpeed/site issue evidence, and optional compact crawler/search technical facts supplied by Ingest.
 
-## Source Priority
+## WorkPods Reads
 
-1. PageSpeed/page quality results and direct rendered-page inspection.
-2. Sitemap/robots/canonical/indexation evidence.
-3. Tech-stack evidence from headers, scripts, structured data, and page markup.
+Read brand pages, page attributes, page quality rows, site issues, site health, tech signals, search performance rows, and prior technical receipts.
 
 ## Procedure
 
-1. Consolidate duplicate technical issues and preserve page/url scope.
-2. Record site issues, site health counts when measurable, page attributes, and tech signals.
-3. Prioritize issues that affect indexing, crawling, Core Web Vitals, citation eligibility, or conversion.
-4. Do not overstate issues that were not directly observed.
+1. Consolidate duplicate technical issues across inventory and PageSpeed evidence while preserving URL/page scope.
+2. Persist site issues, site health counts, page attributes, and tech signals only when directly evidenced.
+3. Prioritize issues affecting indexing, crawlability, Core Web Vitals, structured data, citation eligibility, or conversion.
+4. Separate measured evidence from inferred recommendations.
+5. Reconcile issue-found, issue-persisted, duplicate, skipped, tech-signal, and receipt counts.
+6. Return partial status for missing PageSpeed or compact crawler evidence while still persisting supported findings.
+
+## Do Not
+
+- Do not reopen broad website browsing, run a local browser, crawl the site, or fetch raw pages.
+- Do not create content strategy or lifecycle recommendations unless they are direct consequences of technical blockers.
+- Do not overstate issues that were not directly observed.
 
 ## Required Output Fields
 
@@ -39,4 +45,4 @@ If persisted count is lower than found count, include `site_issues_not_persisted
 
 ## Handoff
 
-Include top issues, affected URLs, severity rationale, site health caveats, and tech-stack signals.
+Include top issues, affected URLs/page ids, severity rationale, site health caveats, tech-stack signals, count reconciliation, receipts, and recommendations for final/content/lifecycle synthesis.

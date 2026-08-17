@@ -9,13 +9,11 @@ Use after competitor expansion and baseline prompt program. Do not submit scans 
 
 ## Inputs
 
-Use competitors, offerings, content clusters when available, baseline prompt themes, search topics, and funnel context.
+Expect baseline prompt program, competitor expansion, offering catalog, content clusters when available, search topics/keyword themes, geography, and funnel context.
 
-## Source Priority
+## WorkPods Reads
 
-1. Existing tracked topics/queries and competitor tiers.
-2. Product/offering and content strategy context.
-3. Search result language and customer intent patterns.
+Read tracked topics, tracked keyword queries, tracked prompt queries, competitors, products/offers, content clusters, and prior prompt receipts.
 
 ## Procedure
 
@@ -23,6 +21,14 @@ Use competitors, offerings, content clusters when available, baseline prompt the
 2. Attach prompts to relevant topics with intent, funnel stage, priority, and brand classification.
 3. Avoid near-duplicate prompts and speculative categories.
 4. Persist prompt queries and topics through the scoped WorkPods write surface.
+5. Reconcile candidate, created, reused, duplicate, skipped, topic-linked, and receipt counts.
+6. If offering or competitor evidence is partial, expand only supported prompt groups and report missing coverage.
+
+## Do Not
+
+- Do not browse, search, submit scans, or analyze observations.
+- Do not name provider-specific prompt-analysis systems; use generic answer-engine terminology.
+- Do not create prompts for unsupported categories or competitors.
 
 ## Required Output Fields
 
@@ -36,4 +42,4 @@ Return the common JSON envelope plus:
 
 ## Handoff
 
-Include prompt groups, topic references, scan-ready subset guidance, and coverage gaps.
+Include prompt groups, topic references, scan-ready subset guidance, competitor/offering coverage gaps, count reconciliation, receipts, and skipped prompt reasons.

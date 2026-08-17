@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 compose() {
-  docker compose -f compose.codex-pods.yml "$@"
+  sudo docker compose -f compose.codex-pods.yml "$@"
 }
 
 build_image() {
@@ -39,6 +39,14 @@ case "${1:-help}" in
   seed-auth)
     ./scripts/seed-codex-pod-auth
     ;;
+  migrate-hermes-identities)
+    shift || true
+    ./scripts/migrate-hermes-pods prepare "$@"
+    ;;
+  decommission-hermes)
+    shift || true
+    ./scripts/migrate-hermes-pods decommission "$@"
+    ;;
   validate)
     ./scripts/validate-codex-pods
     ;;
@@ -55,6 +63,10 @@ Commands:
   logs [svc]  Follow logs for all services or one service
   config      Render Docker Compose config
   seed-auth   Copy host Codex auth.json into each pod state directory
+  migrate-hermes-identities [--force]
+               Reuse the live Hermes Buzz identities and MCP credentials
+  decommission-hermes
+               Stop and remove the old Hermes containers without volumes
   validate    Run static pod manifest/config validation
 MSG
     ;;

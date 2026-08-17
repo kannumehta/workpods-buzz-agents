@@ -9,20 +9,25 @@ Use for `enrichment-search-performance` only when connected search or SEO-suite 
 
 ## Inputs
 
-Use tracked topics/queries, owned pages, connected source status, and available search/SEO metrics.
+Expect tracked topics/queries, owned pages, connected source status, Semrush/search evidence packets when available, date ranges, and source limits.
 
-## Source Priority
+## WorkPods Reads
 
-1. Connected Google Search Console or equivalent first-party source.
-2. SEO suite keyword/ranking/SERP data when available.
-3. Existing WorkPods query/page records for ids and dedupe.
+Read tracked topics, tracked keyword queries, brand pages, existing search performance rows, rankings, SERP features, authority metrics, and source connection status.
 
 ## Procedure
 
-1. Record search performance rows for known tracked queries and landing pages.
-2. Record ranking and SERP feature facts when available.
-3. Record source status for connected/unavailable providers.
-4. Do not invent volume, click, impression, or ranking values.
+1. Match metrics to existing tracked queries/topics and landing pages.
+2. Persist search performance rows, ranking rows, SERP feature facts, and authority/visibility metrics only when values are supplied by connected or assigned sources.
+3. Record source/date-range coverage and unavailable provider status.
+4. Reconcile requested query/page coverage, matched records, persisted metric rows, skipped duplicates, and unavailable metrics.
+5. Complete with `INSUFFICIENT_DATA` when no connected or Semrush evidence exists; include what would be needed later.
+
+## Do Not
+
+- Do not browse search results or scrape SERPs.
+- Do not invent volume, click, impression, rank, or SERP feature values.
+- Do not create new tracked prompt queries; use existing query/topic records.
 
 ## Required Output Fields
 
@@ -37,4 +42,4 @@ Return the common JSON envelope plus:
 
 ## Handoff
 
-Include source availability, date range, query/page coverage, and metric gaps.
+Include source availability, date ranges, query/page coverage, persisted metric counts, ranking/SERP caveats, count reconciliation, receipts, and gaps for final synthesis.

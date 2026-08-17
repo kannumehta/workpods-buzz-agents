@@ -5,24 +5,30 @@ description: Use only for enrichment competitor expansion: deepen competitors, i
 
 ## When To Use
 
-Use after baseline competitor map. Do not change primary competitor tiers unless stronger evidence clearly warrants it and the write surface supports idempotent updates.
+Use after baseline competitor map and after Ingest supplies enrichment competitor candidates or assigned Semrush overlap evidence.
 
 ## Inputs
 
-Use baseline competitor handoff, tracked topics/queries, search market context, Semrush/SEO data when available, and scoped competitor reads.
+Expect baseline competitor handoff, enrichment competitor candidates, tracked topics/queries, search market context, Semrush/SEO overlap data when available, and candidate retrieval limits.
 
-## Source Priority
+## WorkPods Reads
 
-1. Existing primary/secondary competitors from WorkPods.
-2. Search/SERP/category overlap and SEO-suite overlap data.
-3. Competitor websites and comparison pages.
+Read existing competitors, competitor intelligence, competitor overlap, authority/visibility metrics, tracked topics/queries, and baseline map receipts.
 
 ## Procedure
 
-1. Expand or refine competitor list with direct and adjacent competitors.
-2. Persist competitor intelligence and metrics: authority, overlap, visibility, strengths, weaknesses, gaps, differentiators.
-3. Keep tier changes conservative and evidence-backed.
-4. Exclude publishers/directories unless they are important citation or visibility domains rather than competitors.
+1. Normalize enrichment candidates and merge against the baseline map.
+2. Add only evidence-supported direct or adjacent competitors; record important non-competitor domains as visibility/citation context only when the write surface supports it.
+3. Refine intelligence and metrics: authority, overlap, visibility, strengths, weaknesses, gaps, differentiators, and evidence source.
+4. Preserve baseline primary tiers unless stronger evidence clearly justifies an update.
+5. Reconcile candidate, added, updated, reused, rejected, metric-row, and receipt counts.
+6. Treat missing Semrush or thin candidate evidence as `INSUFFICIENT_DATA` for metrics, not a whole-step failure.
+
+## Do Not
+
+- Do not independently search or browse competitor websites.
+- Do not replace valid baseline tiers with weaker enrichment data.
+- Do not turn publishers/directories/marketplaces into competitors unless they compete directly.
 
 ## Required Output Fields
 
@@ -39,4 +45,4 @@ If persisted count is lower than found count, include `competitors_not_persisted
 
 ## Handoff
 
-Include expanded competitor ids/domains, metric caveats, and opportunity gaps.
+Include added/updated/reused competitor ids/domains, preserved or changed tier rationale, metric caveats, opportunity gaps, count reconciliation, and receipts for prompt universe and answer analysis.

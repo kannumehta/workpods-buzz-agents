@@ -9,13 +9,11 @@ Use after the prompt universe exists. Do not wait for long-running results or an
 
 ## Inputs
 
-Use prompt universe handoff, scoped tracked prompt reads, brand id, and desired answer surfaces.
+Expect prompt universe handoff, tracked prompt ids, priority guidance, brand id, scan surfaces/policy supplied by backend, and any existing scan batch receipts.
 
-## Source Priority
+## WorkPods Reads
 
-1. Persisted tracked prompts from WorkPods.
-2. Prompt universe handoff when persisted ids are not available.
-3. Existing scan batch reads to avoid duplicate submissions.
+Read tracked prompt queries, topics, competitors, existing scan batches, and recent scan status to avoid duplicate submission.
 
 ## Procedure
 
@@ -23,6 +21,14 @@ Use prompt universe handoff, scoped tracked prompt reads, brand id, and desired 
 2. Submit the scan through the generic answer-engine scan capability.
 3. Return the scan batch id, submitted prompt count, surfaces count, and any skipped prompt reasons.
 4. Do not mention provider-specific names. Do not block waiting for completion.
+5. Reconcile available, selected, submitted, skipped, duplicate-batch, and receipt counts.
+6. If submission capability is unavailable, return `BLOCKED` for submission while preserving the selected prompt set in the handoff.
+
+## Do Not
+
+- Do not browse, search, or create new tracked prompts.
+- Do not wait for scan completion or analyze observations.
+- Do not name provider-specific internal analysis services.
 
 ## Required Output Fields
 
@@ -37,4 +43,4 @@ Return the common JSON envelope plus:
 
 ## Handoff
 
-Include scan batch id, submitted prompt count, surfaces, expected downstream analysis conditions, and skipped prompts.
+Include scan batch id, submitted prompt count, surfaces, selected/skipped prompt ids and reasons, duplicate-batch caveats, receipts, and downstream wait/analysis conditions.
