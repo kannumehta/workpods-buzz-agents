@@ -5,7 +5,8 @@ if [ "$#" -eq 0 ]; then
   set -- claude codex
 fi
 
+"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/update-workspace-roots" "$@"
+
 for agent in "$@"; do
   systemctl --user enable --now "workpods-buzz-agent@${agent}.service"
 done
-

@@ -34,6 +34,11 @@ Useful commands:
 ./scripts/logs claude
 ```
 
+`scripts/start` refreshes `BUZZ_ACP_ADDITIONAL_DIRECTORIES` in the ignored
+runtime env files. It derives those paths from the current umbrella layout, so
+symlinked service checkouts are exposed to ACP sessions without committing
+machine-specific absolute paths.
+
 Session controls are per Buzz channel:
 
 ```text

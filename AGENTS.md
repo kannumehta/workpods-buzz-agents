@@ -39,6 +39,10 @@ The default permission mode is `plan`. Use `/mode dontAsk` only for a channel
 session where Musketeer explicitly wants the agent to execute without approval
 prompts.
 
+`scripts/start` refreshes `BUZZ_ACP_ADDITIONAL_DIRECTORIES` in the ignored
+runtime env files from the current umbrella layout. Keep that behavior
+machine-local; do not commit absolute workspace paths.
+
 The harness publishes final assistant text as the signed Buzz reply. Do not
 configure agents to call `buzz messages send` for the ordinary response to the
 triggering message.

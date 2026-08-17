@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+AGENTS_REPO="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+ROOT="$(cd -- "${AGENTS_REPO}/.." && pwd)"
+ENV_DIR="${ROOT}/.runtime/secrets/buzz-agents"
+
+entries=(
+  workpods-buzz
+  workpods
+  workpods-ingest
+  workpods-browse
+  workpods-semrush-mcp
+  workpods-pagespeed-mcp
+  workpods-email-management
+  workpods-mcp-registry
+  workpods-agent-contracts
+  workpods-buzz-agents
+  buzz-source
+  buzz-deploy
+)
+
+roots=()
+for entry in "${entries[@]}"; do
+  path="${ROOT}/${entry}"
+  [ -e "${path}" ] || continue
+  real="$(readlink -f -- "${path}")"
+  case "${real}" in
+    "${ROOT}"/*) ;;
+    *) roots+=("${real}") ;;
+  esac
+done
+
+value="$(IFS=,; printf '%s' "${roots[*]}")"
+mkdir -p "${ENV_DIR}"
+
+if [ "$#" -eq 0 ]; then
+  set -- claude codex
+fi
+
+for agent in "$@"; do
+  env_file="${ENV_DIR}/${agent}.env"
+  if [ ! -f "${env_file}" ]; then
+    echo "warning: missing env file: ${env_file}" >&2
+    continue
+  fi
+  tmp="$(mktemp)"
+  grep -v '^BUZZ_ACP_ADDITIONAL_DIRECTORIES=' "${env_file}" > "${tmp}" || true
+  if [ -n "${value}" ]; then
+    printf 'BUZZ_ACP_ADDITIONAL_DIRECTORIES=%s\n' "${value}" >> "${tmp}"
+  fi
+  install -m 0600 "${tmp}" "${env_file}"
+  rm -f "${tmp}"
+done
