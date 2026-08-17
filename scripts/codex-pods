@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+compose() {
+  docker compose -f compose.codex-pods.yml "$@"
+}
+
+build_image() {
+  compose --profile build build codex-pod-image
+}
+
+case "${1:-help}" in
+  build)
+    build_image
+    ;;
+  start|up)
+    build_image
+    compose up -d --wait
+    ;;
+  stop|down)
+    compose down
+    ;;
+  restart)
+    build_image
+    compose up -d --force-recreate --wait
+    ;;
+  status|ps)
+    compose ps
+    ;;
+  logs)
+    shift || true
+    compose logs -f "${@:-}"
+    ;;
+  config)
+    compose config
+    ;;
+  seed-auth)
+    ./scripts/seed-codex-pod-auth
+    ;;
+  validate)
+    ./scripts/validate-codex-pods
+    ;;
+  help|-h|--help)
+    cat <<'MSG'
+Usage: ./scripts/codex-pods <command>
+
+Commands:
+  build       Build the shared Codex pod image
+  start       Build and start all Codex pod containers
+  stop        Stop the Codex pod stack
+  restart     Rebuild and recreate the Codex pod stack
+  status      Show Compose service status
+  logs [svc]  Follow logs for all services or one service
+  config      Render Docker Compose config
+  seed-auth   Copy host Codex auth.json into each pod state directory
+  validate    Run static pod manifest/config validation
+MSG
+    ;;
+  *)
+    echo "unknown command: $1" >&2
+    echo "Run ./scripts/codex-pods help" >&2
+    exit 2
+    ;;
+esac

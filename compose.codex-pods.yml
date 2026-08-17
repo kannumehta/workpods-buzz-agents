@@ -1,0 +1,166 @@
+name: workpods-buzz-agents
+
+x-codex-env: &codex-env
+  BUZZ_ACP_AGENT_COMMAND: codex-acp
+  BUZZ_ACP_AGENT_ARGS: ""
+  BUZZ_ACP_ALLOWED_RESPOND_TO: anyone
+  BUZZ_ACP_RESPOND_TO: anyone
+  BUZZ_ACP_PERMISSION_MODE: auto
+  BUZZ_ACP_STRIP_AGENT_BUZZ_ENV: "true"
+  BUZZ_ACP_NO_BASE_PROMPT: "true"
+  BUZZ_ACP_MODEL: gpt-5.6-luna
+  INITIAL_AGENT_MODE: agent
+  NO_BROWSER: "1"
+
+x-codex-pod: &codex-pod
+  image: workpods/buzz-codex-pod:local
+  restart: unless-stopped
+  working_dir: /var/lib/workpods-buzz-agent/workspace
+  command: ["buzz-acp"]
+  volumes:
+    - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+  networks:
+    - workpods
+
+services:
+  codex-pod-image:
+    image: workpods/buzz-codex-pod:local
+    build:
+      context: .
+      dockerfile: Dockerfile.codex-pod
+    command: ["true"]
+    restart: "no"
+    profiles: ["build"]
+    networks:
+      - workpods
+
+  workpods-agent-workpod:
+    <<: *codex-pod
+    container_name: workpods-agent-workpod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/workpod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: workpod
+      POD_MCP_SERVERS: workpods
+      WORKPODS_MCP_TOOL_PROFILE: "internal-workpod;admin"
+      BUZZ_ACP_DISPLAY_NAME: workpod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: workpod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/workpod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-geo-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-geo-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/geo-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: geo-pod
+      POD_MCP_SERVERS: workpods,composio,workpods-semrush-mcp
+      WORKPODS_MCP_TOOL_PROFILE: "internal-geo;admin"
+      BUZZ_ACP_DISPLAY_NAME: geo-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: geo-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/geo-pod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-content-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-content-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/content-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: content-pod
+      POD_MCP_SERVERS: workpods,workpods-semrush-mcp
+      WORKPODS_MCP_TOOL_PROFILE: "internal-content;admin"
+      BUZZ_ACP_DISPLAY_NAME: content-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: content-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/content-pod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-performance-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-performance-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/performance-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: performance-pod
+      POD_MCP_SERVERS: workpods,composio,workpods-semrush-mcp,workpods-pagespeed-mcp
+      WORKPODS_MCP_TOOL_PROFILE: "internal-performance;admin"
+      BUZZ_ACP_DISPLAY_NAME: performance-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: performance-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/performance-pod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-lifecycle-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-lifecycle-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/lifecycle-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: lifecycle-pod
+      POD_MCP_SERVERS: workpods,composio
+      WORKPODS_MCP_TOOL_PROFILE: "internal-lifecycle;admin"
+      BUZZ_ACP_DISPLAY_NAME: lifecycle-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: lifecycle-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/lifecycle-pod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-marketing-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-marketing-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/marketing-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: marketing-pod
+      POD_MCP_SERVERS: workpods,composio,workpods-email-management
+      WORKPODS_MCP_TOOL_PROFILE: "internal-workpod;internal-content;internal-geo;internal-performance;internal-lifecycle;admin"
+      BUZZ_ACP_DISPLAY_NAME: marketing-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: marketing-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/marketing-pod:/var/lib/workpods-buzz-agent
+
+  workpods-agent-support-desk-pod:
+    <<: *codex-pod
+    container_name: workpods-agent-support-desk-pod
+    env_file:
+      - path: ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/support-desk-pod.env
+        required: false
+    environment:
+      <<: *codex-env
+      WORKPODS_POD_NAME: support-desk-pod
+      POD_MCP_SERVERS: workpods
+      WORKPODS_MCP_TOOL_PROFILE: "support;support-admin;admin"
+      BUZZ_ACP_DISPLAY_NAME: support-desk-pod
+      BUZZ_ACP_SESSION_STATE_FILE: /var/lib/workpods-buzz-agent/sessions.json
+      BUZZ_ACP_SESSION_TITLE: support-desk-pod
+    volumes:
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/bin/buzz-acp:/usr/local/bin/buzz-acp:ro
+      - ${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/state/buzz-agents/pods/support-desk-pod:/var/lib/workpods-buzz-agent
+
+networks:
+  workpods:
+    external: true
+    name: workpods

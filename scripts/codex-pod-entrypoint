@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "missing required environment variable: ${name}" >&2
+    exit 64
+  fi
+}
+
+truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+toml_string() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+has_server() {
+  case ",${POD_MCP_SERVERS:-}," in
+    *,"$1",*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+require_env WORKPODS_POD_NAME
+require_env BUZZ_RELAY_URL
+require_env BUZZ_PRIVATE_KEY
+require_env WORKPODS_MCP_TOKEN
+require_env WORKPODS_MCP_TOOL_PROFILE
+require_env POD_MCP_SERVERS
+
+export CODEX_HOME="${CODEX_HOME:-/var/lib/workpods-buzz-agent/codex}"
+export APP_SERVER_LOGS="${APP_SERVER_LOGS:-/var/log/workpods-buzz-agent}"
+export NO_BROWSER="${NO_BROWSER:-1}"
+export BUZZ_ACP_AGENT_COMMAND="${BUZZ_ACP_AGENT_COMMAND:-codex-acp}"
+export BUZZ_ACP_AGENT_ARGS="${BUZZ_ACP_AGENT_ARGS:-}"
+export BUZZ_ACP_RESPOND_TO="${BUZZ_ACP_RESPOND_TO:-anyone}"
+export BUZZ_ACP_ALLOWED_RESPOND_TO="${BUZZ_ACP_ALLOWED_RESPOND_TO:-anyone}"
+export BUZZ_ACP_PERMISSION_MODE="${BUZZ_ACP_PERMISSION_MODE:-auto}"
+export BUZZ_ACP_STRIP_AGENT_BUZZ_ENV="${BUZZ_ACP_STRIP_AGENT_BUZZ_ENV:-true}"
+export BUZZ_ACP_NO_BASE_PROMPT="${BUZZ_ACP_NO_BASE_PROMPT:-true}"
+export BUZZ_ACP_MODEL="${BUZZ_ACP_MODEL:-gpt-5.6-luna}"
+export BUZZ_ACP_SESSION_TITLE="${BUZZ_ACP_SESSION_TITLE:-${WORKPODS_POD_NAME}}"
+export INITIAL_AGENT_MODE="${INITIAL_AGENT_MODE:-agent}"
+
+pod_base="${POD_ROOT_BASE:-/opt/workpods/pods}"
+pod_root="${pod_base}/${WORKPODS_POD_NAME}"
+workspace="${AGENT_WORKSPACE:-/var/lib/workpods-buzz-agent/workspace}"
+system_prompt="${SYSTEM_PROMPT_PATH:-/var/lib/workpods-buzz-agent/system.md}"
+
+if [ ! -d "${pod_root}" ]; then
+  echo "unknown pod root: ${pod_root}" >&2
+  exit 66
+fi
+
+if has_server composio; then
+  require_env COMPOSIO_MCP_URL
+  require_env COMPOSIO_API_KEY
+fi
+if has_server workpods-pagespeed-mcp; then
+  require_env PAGESPEED_MCP_BEARER_TOKEN
+fi
+if has_server workpods-email-management; then
+  require_env EMAIL_MANAGEMENT_MCP_BEARER_TOKEN
+fi
+
+mkdir -p "${CODEX_HOME}" "${APP_SERVER_LOGS}" "${workspace}/.agents" "$(dirname "${system_prompt}")"
+ln -sfnT "${pod_root}/skills" "${workspace}/.agents/skills"
+ln -sfnT "${pod_root}/skills" "${CODEX_HOME}/skills"
+
+{
+  cat "${pod_base}/common/system-prefix.md"
+  printf '\n[Role]\n'
+  cat "${pod_root}/SOUL.md"
+  if [ -s "${pod_root}/memories/USER.md" ]; then
+    printf '\n[Team Context]\n'
+    cat "${pod_root}/memories/USER.md"
+  fi
+} > "${system_prompt}"
+export BUZZ_ACP_SYSTEM_PROMPT_FILE="${system_prompt}"
+
+umask 077
+config_tmp="${CODEX_HOME}/config.toml.tmp"
+{
+  printf 'model = "gpt-5.6-luna"\n'
+  printf 'model_reasoning_effort = "max"\n'
+  printf 'approval_policy = "never"\n'
+  printf 'sandbox_mode = "workspace-write"\n'
+  printf '\n[sandbox_workspace_write]\n'
+  printf 'network_access = true\n'
+
+  if has_server workpods; then
+    printf '\n[mcp_servers.workpods]\n'
+    printf 'url = "https://beta-api.workpods.ai/mcp/"\n'
+    printf 'bearer_token_env_var = "WORKPODS_MCP_TOKEN"\n'
+    printf '[mcp_servers.workpods.env_http_headers]\n'
+    printf '"X-WorkPods-Tool-Profile" = "WORKPODS_MCP_TOOL_PROFILE"\n'
+  fi
+
+  if has_server composio; then
+    printf '\n[mcp_servers.composio]\n'
+    printf 'url = %s\n' "$(toml_string "${COMPOSIO_MCP_URL}")"
+    printf '[mcp_servers.composio.env_http_headers]\n'
+    printf 'x-api-key = "COMPOSIO_API_KEY"\n'
+  fi
+
+  if has_server workpods-semrush-mcp; then
+    printf '\n[mcp_servers.workpods-semrush-mcp]\n'
+    printf 'url = "http://workpods-semrush-mcp:8000/mcp"\n'
+  fi
+
+  if has_server workpods-pagespeed-mcp; then
+    printf '\n[mcp_servers.workpods-pagespeed-mcp]\n'
+    printf 'url = "http://workpods-pagespeed-mcp:8000/mcp/"\n'
+    printf 'bearer_token_env_var = "PAGESPEED_MCP_BEARER_TOKEN"\n'
+  fi
+
+  if has_server workpods-email-management; then
+    printf '\n[mcp_servers.workpods-email-management]\n'
+    printf 'url = "http://workpods-email-management-mcp:8000/mcp/"\n'
+    printf 'bearer_token_env_var = "EMAIL_MANAGEMENT_MCP_BEARER_TOKEN"\n'
+  fi
+} > "${config_tmp}"
+mv "${config_tmp}" "${CODEX_HOME}/config.toml"
+
+if [ ! -s "${CODEX_HOME}/auth.json" ] && [ -z "${CODEX_API_KEY:-}" ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "warning: ${CODEX_HOME}/auth.json is missing and no Codex API key env is set" >&2
+fi
+
+exec "$@"

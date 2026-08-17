@@ -23,6 +23,23 @@ claude
 codex
 ```
 
+The team-facing internal WorkPods pods are Dockerized Codex ACP agents:
+
+```text
+workpod
+geo-pod
+content-pod
+performance-pod
+lifecycle-pod
+marketing-pod
+support-desk-pod
+```
+
+Keep their source configuration under `pods/`, `compose.codex-pods.yml`, and
+the pod scripts in `scripts/`. Live pod env files must stay under
+`.runtime/secrets/buzz-agents/pods/` in the umbrella checkout and must never be
+committed.
+
 Model and permission mode are controlled per Buzz channel session with:
 
 ```text
@@ -51,3 +68,18 @@ transport only for these coding agents.
 The harness publishes final assistant text as the signed Buzz reply. Do not
 configure agents to call `buzz messages send` for the ordinary response to the
 triggering message.
+
+## Codex Pod Rules
+
+- Use one container per Buzz-visible pod identity.
+- Use `BUZZ_ACP_RESPOND_TO=anyone` for pods; host `claude` and `codex` remain
+  owner/allowlist controlled.
+- Keep `gpt-5.6-luna` and `model_reasoning_effort = "max"` in generated Codex
+  config unless a future issue changes the model policy.
+- Keep pod skills structurally scoped under `pods/<pod>/skills/`.
+- Do not add Hermes or Kanban runtime dependencies. Archived Hermes patches may
+  live in `workpods-buzz`, but the active pod path is Codex + `buzz-acp`.
+- Seed Codex auth by copying into each pod state directory; do not mount the
+  host `~/.codex` read-only into the containers.
+- Run `./scripts/codex-pods validate` after changing pod manifests, prompts,
+  Compose, or skill sets.

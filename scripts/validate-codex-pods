@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+import tomllib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PODS_FILE = ROOT / "pods" / "pods.toml"
+COMPOSE_FILE = ROOT / "compose.codex-pods.yml"
+ENTRYPOINT = ROOT / "scripts" / "codex-pod-entrypoint"
+
+EXPECTED_PODS = [
+    "workpod",
+    "geo-pod",
+    "content-pod",
+    "performance-pod",
+    "lifecycle-pod",
+    "marketing-pod",
+    "support-desk-pod",
+]
+
+
+def fail(message: str) -> None:
+    print(f"validate-codex-pods: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def main() -> int:
+    manifest = tomllib.loads(PODS_FILE.read_text(encoding="utf-8"))
+    defaults = manifest.get("defaults", {})
+    pods = manifest.get("pods", {})
+    if list(pods) != EXPECTED_PODS:
+        fail(f"pod order/name mismatch: {list(pods)}")
+    if defaults.get("model") != "gpt-5.6-luna":
+        fail("default model must be gpt-5.6-luna")
+    if defaults.get("model_reasoning_effort") != "max":
+        fail("default reasoning effort must be max")
+    if defaults.get("respond_to") != "anyone":
+        fail("pods must be team-facing respond_to=anyone")
+
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+    entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
+    if "model = \"gpt-5.6-luna\"" not in entrypoint:
+        fail("entrypoint does not render gpt-5.6-luna")
+    if "model_reasoning_effort = \"max\"" not in entrypoint:
+        fail("entrypoint does not render max reasoning")
+    if "BUZZ_ACP_RESPOND_TO: anyone" not in compose:
+        fail("compose does not set team-wide respond_to")
+
+    for pod, config in pods.items():
+        pod_dir = ROOT / "pods" / pod
+        if not (pod_dir / "SOUL.md").is_file():
+            fail(f"{pod}: missing SOUL.md")
+        if not (pod_dir / "memories" / "USER.md").is_file():
+            fail(f"{pod}: missing memories/USER.md")
+        service = f"workpods-agent-{pod}"
+        if service not in compose:
+            fail(f"{pod}: missing compose service {service}")
+        env_path = "${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}/.runtime/secrets/buzz-agents/pods/" + f"{pod}.env"
+        if env_path not in compose:
+            fail(f"{pod}: missing compose env_file {env_path}")
+        if f"WORKPODS_POD_NAME: {pod}" not in compose:
+            fail(f"{pod}: compose missing WORKPODS_POD_NAME")
+
+        skills = config.get("skills", [])
+        if not skills:
+            fail(f"{pod}: no skills declared")
+        for skill in skills:
+            skill_file = pod_dir / "skills" / skill / "SKILL.md"
+            if not skill_file.is_file():
+                fail(f"{pod}: missing skill {skill}")
+        installed = sorted(p.name for p in (pod_dir / "skills").iterdir() if p.is_dir())
+        if installed != sorted(skills):
+            fail(f"{pod}: installed skills do not match manifest")
+        if "kanban-task-decomposition" in installed:
+            fail(f"{pod}: Kanban skill must not be installed")
+
+        example = ROOT / "secrets" / "pods" / f"{pod}.env.example"
+        if not example.is_file():
+            fail(f"{pod}: missing env example")
+        example_text = example.read_text(encoding="utf-8")
+        if config["workpods_tool_profile"] not in example_text:
+            fail(f"{pod}: env example missing tool profile")
+
+    print("validate-codex-pods: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

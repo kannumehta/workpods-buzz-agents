@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+source_auth="${CODEX_SOURCE_AUTH_JSON:-/home/ubuntu/.codex/auth.json}"
+umbrella_root="${WORKPODS_UMBRELLA_ROOT:-/home/ubuntu/workpods-umbrella}"
+state_root="${WORKPODS_CODEX_POD_STATE_ROOT:-${umbrella_root}/.runtime/state/buzz-agents/pods}"
+
+if [ ! -r "${source_auth}" ]; then
+  echo "missing readable Codex auth file: ${source_auth}" >&2
+  exit 1
+fi
+
+pods=(
+  workpod
+  geo-pod
+  content-pod
+  performance-pod
+  lifecycle-pod
+  marketing-pod
+  support-desk-pod
+)
+
+for pod in "${pods[@]}"; do
+  target_dir="${state_root}/${pod}/codex"
+  mkdir -p "${target_dir}"
+  install -m 0600 "${source_auth}" "${target_dir}/auth.json"
+  echo "${pod}: seeded Codex auth"
+done

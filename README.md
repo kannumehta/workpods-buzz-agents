@@ -1,6 +1,8 @@
 # WorkPods Buzz Agents
 
-Two stable Buzz coding-agent identities run on the beta machine:
+This repo owns the non-secret runner setup for WorkPods internal Buzz agents.
+
+Two stable host-level coding-agent identities run on the beta machine:
 
 ```text
 claude
@@ -57,3 +59,63 @@ Session controls are per Buzz channel:
 The client-facing permission modes are `plan`, `auto`, and `edit`. The default
 permission mode is `plan`. Use `/mode auto` only for a channel session where
 Musketeer explicitly wants the agent to execute without approval prompts.
+
+## Dockerized Codex Pods
+
+The team-facing WorkPods pods run as one Docker Compose service per Buzz
+identity:
+
+```text
+workpod
+geo-pod
+content-pod
+performance-pod
+lifecycle-pod
+marketing-pod
+support-desk-pod
+```
+
+They use the same `buzz-acp` binary and system-prompt mechanism as the host
+coding agents, but run inside containers with `codex-acp`. They differ from the
+host `claude`/`codex` identities in two ways:
+
+- `BUZZ_ACP_RESPOND_TO=anyone`, so team members can use them.
+- Runtime state, `CODEX_HOME`, prompt composition, and skills are per container.
+
+The pod model is `gpt-5.6-luna` with `model_reasoning_effort = "max"`.
+`scripts/codex-pods seed-auth` copies host Codex auth into each pod state
+directory so containers can refresh their own credentials.
+
+Pod definitions live in:
+
+```text
+pods/pods.toml
+pods/<pod>/SOUL.md
+pods/<pod>/memories/USER.md
+pods/<pod>/skills/
+compose.codex-pods.yml
+```
+
+Machine-local pod secrets are ignored and live under:
+
+```text
+/home/ubuntu/workpods-umbrella/.runtime/secrets/buzz-agents/pods/<pod>.env
+```
+
+Examples are committed under `secrets/pods/*.env.example`. Do not commit live
+private keys, auth JSON, bearer tokens, Composio session URLs, or generated
+state.
+
+Useful pod commands:
+
+```bash
+./scripts/codex-pods validate
+./scripts/codex-pods seed-auth
+./scripts/codex-pods build
+./scripts/codex-pods config
+./scripts/codex-pods start
+./scripts/codex-pods status
+```
+
+Do not start or deploy the pod stack as part of source-only changes unless the
+operator explicitly asks for live deployment.
