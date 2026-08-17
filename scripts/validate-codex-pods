@@ -22,6 +22,13 @@ EXPECTED_PODS = [
     "support-desk-pod",
 ]
 
+STALE_SOUL_SKILL_PATTERNS = [
+    "use these skills",
+    "installed skill",
+    "blueprint skill",
+    "workpods-mcp-access-diagnostics",
+]
+
 
 def fail(message: str) -> None:
     print(f"validate-codex-pods: {message}", file=sys.stderr)
@@ -58,13 +65,19 @@ def main() -> int:
         fail("system prefix missing From collaboration contract")
     if "Use plain `@Name` text" not in system_prefix:
         fail("system prefix missing mention collaboration contract")
+    if "When an action is blocked by permission mode" not in system_prefix:
+        fail("system prefix missing permission-mode reporting contract")
 
     for pod, config in pods.items():
         pod_dir = ROOT / "pods" / pod
         if not (pod_dir / "SOUL.md").is_file():
             fail(f"{pod}: missing SOUL.md")
-        if "skill" in (pod_dir / "SOUL.md").read_text(encoding="utf-8").lower():
-            fail(f"{pod}: SOUL.md must not reference skills")
+        soul = (pod_dir / "SOUL.md").read_text(encoding="utf-8").lower()
+        stale_patterns = [
+            pattern for pattern in STALE_SOUL_SKILL_PATTERNS if pattern in soul
+        ]
+        if stale_patterns:
+            fail(f"{pod}: SOUL.md has stale skill instructions: {stale_patterns}")
         if not (pod_dir / "memories" / "USER.md").is_file():
             fail(f"{pod}: missing memories/USER.md")
         service = f"workpods-agent-{pod}"

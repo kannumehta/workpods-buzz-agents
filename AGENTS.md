@@ -78,8 +78,8 @@ triggering message.
   config unless a future issue changes the model policy.
 - Keep the common pod prompt aligned with the host agents' collaboration
   contract: honor incoming `From:` metadata, use explicit `@Name` tags only when
-  attention is needed, tag blockers/delegators, and return ordinary replies
-  through the harness.
+  attention is needed, tag blockers/delegators, report permission-mode blockers,
+  and return ordinary replies through the harness.
 - Keep pod roles and operating boundaries in `pods/<pod>/SOUL.md`, with team
   context in `pods/<pod>/memories/USER.md`.
 - Do not install pod, user, repository, or bundled system skills. Keep pod skill

@@ -102,7 +102,8 @@ operating boundaries live in `SOUL.md`, and generated Codex config sets
 The generated system prompt combines the common transport/collaboration
 contract, the pod's `SOUL.md`, and its `memories/USER.md`. The common contract
 matches the host coding agents' handling of incoming `From:` metadata, explicit
-`@Name` tags, blockers, delegated work, and ordinary harness replies.
+`@Name` tags, blockers, delegated work, permission-mode blockers, and ordinary
+harness replies.
 
 Machine-local pod secrets are ignored and live under:
 

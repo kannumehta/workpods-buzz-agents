@@ -77,8 +77,14 @@ for legacy_skill_path in "${workspace}/.agents/skills" "${CODEX_HOME}/skills"; d
   if [ -L "${legacy_skill_path}" ]; then
     unlink "${legacy_skill_path}"
   elif [ -e "${legacy_skill_path}" ]; then
-    echo "unexpected legacy skill path is not a symlink: ${legacy_skill_path}" >&2
-    exit 65
+    disabled_path="${legacy_skill_path}.disabled"
+    suffix=0
+    while [ -e "${disabled_path}" ] || [ -L "${disabled_path}" ]; do
+      suffix=$((suffix + 1))
+      disabled_path="${legacy_skill_path}.disabled.${suffix}"
+    done
+    mv "${legacy_skill_path}" "${disabled_path}"
+    printf 'moved unexpected legacy skill path out of Codex discovery: %s\n' "${disabled_path}" >&2
   fi
 done
 
