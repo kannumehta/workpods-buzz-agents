@@ -59,6 +59,10 @@ if ! docker info >/dev/null 2>&1; then
   sudo -n docker info >/dev/null
   docker_cmd=(sudo -n docker)
 fi
+compose_cmd=("${docker_cmd[@]}" compose)
+if [[ ! -r "$secret_root/${identities[0]}" ]] && sudo -n true >/dev/null 2>&1; then
+  compose_cmd=(sudo -n docker compose)
+fi
 actual=$("${docker_cmd[@]}" image inspect "$image" \
   --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
 test "$actual" = "$revision"
@@ -78,6 +82,6 @@ test -f "$checksum"
 "${docker_cmd[@]}" image inspect \
   workpods/hermes-codex:rollback-bc2171345764 >/dev/null
 
-WORKPODS_BUILD_REVISION="$revision" docker compose \
+WORKPODS_BUILD_REVISION="$revision" "${compose_cmd[@]}" \
   -f pods/compose.pods.yml config --quiet
 printf 'predeploy checks passed for %s\n' "$image"
