@@ -54,6 +54,59 @@ for identity in "${identities[@]}"; do
   fi
 done
 
+state_root="$umbrella/.runtime/state/hermes-pods"
+auth_homes=(
+  internal-workpods/profiles/content-pod
+  internal-workpods/profiles/geo-pod
+  internal-workpods/profiles/lifecycle-pod
+  internal-workpods/profiles/performance-pod
+  marketing-pod
+  support-desk-pod
+)
+for home in "${auth_homes[@]}"; do
+  path="$state_root/$home/auth.json"
+  if ! sudo -n test -f "$path" || sudo -n test -L "$path"; then
+    printf 'seeded Codex auth must be a regular non-symlink file: %s\n' "$path" >&2
+    exit 1
+  fi
+  mode=$(sudo -n stat -c '%a' "$path")
+  owner=$(sudo -n stat -c '%u:%g' "$path")
+  if [[ "$mode" != 600 || "$owner" != 10000:10000 ]]; then
+    printf 'seeded Codex auth must be 10000:10000 mode 600: %s (found %s %s)\n' \
+      "$path" "$owner" "$mode" >&2
+    exit 1
+  fi
+  sudo -n python3 - "$path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    tokens = payload["providers"]["openai-codex"]["tokens"]
+    valid = all(isinstance(tokens.get(key), str) and tokens[key].strip()
+                for key in ("access_token", "refresh_token"))
+except (OSError, ValueError, KeyError, TypeError):
+    valid = False
+if not valid:
+    raise SystemExit(f"invalid seeded Codex auth structure: {path}")
+PY
+  lock_path="$state_root/$home/auth.lock"
+  if ! sudo -n test -f "$lock_path" || sudo -n test -L "$lock_path"; then
+    printf 'seeded Codex auth lock must be a regular non-symlink file: %s\n' \
+      "$lock_path" >&2
+    exit 1
+  fi
+  lock_mode=$(sudo -n stat -c '%a' "$lock_path")
+  lock_owner=$(sudo -n stat -c '%u:%g' "$lock_path")
+  if [[ "$lock_mode" != 600 || "$lock_owner" != 10000:10000 ]]; then
+    printf 'seeded Codex auth lock must be 10000:10000 mode 600: %s (found %s %s)\n' \
+      "$lock_path" "$lock_owner" "$lock_mode" >&2
+    exit 1
+  fi
+done
+
 docker_cmd=(docker)
 if ! docker info >/dev/null 2>&1; then
   sudo -n docker info >/dev/null
@@ -77,6 +130,12 @@ test "$actual_head" = "$PATCH_HEAD"
 test "$actual_tree" = "$PATCH_TREE"
 
 rollback_root=${WORKPODS_ROLLBACK_ARCHIVE_ROOT:?set to the cold rollback archive directory}
+rollback_root=$(realpath "$rollback_root")
+if [[ "$(stat -c '%d' "$rollback_root")" == "$(stat -c '%d' "$umbrella")" ]]; then
+  printf 'rollback archive must be on a different filesystem from the umbrella: %s\n' \
+    "$rollback_root" >&2
+  exit 1
+fi
 checksum="$rollback_root/hermes-codex-rollback-bc2171345764.tar.sha256"
 test -f "$checksum"
 (cd "$rollback_root" && sha256sum -c "$(basename "$checksum")")
@@ -85,4 +144,6 @@ test -f "$checksum"
 
 "${compose_cmd[@]}" \
   -f pods/compose.pods.yml config --quiet
+"${compose_cmd[@]}" \
+  -f pods/compose.pods.yml -f pods/hermes.rollback.yml config --quiet
 printf 'predeploy checks passed for %s\n' "$image"

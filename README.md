@@ -127,9 +127,16 @@ WORKPODS_ROLLBACK_ARCHIVE_ROOT="$COLD_ARCHIVE_ROOT" ./pods/scripts/predeploy
 ```
 
 `predeploy` requires all six identity files to be regular, non-symlink files
-with mode `0600`; verifies the revision image and rollback archive; and renders
-Compose without starting anything. See `pods/DEPLOY.md` for cutover, rollback,
-and session-state recovery procedures.
+owned by UID/GID 10000 with mode `0600`; requires valid seeded Codex auth in all
+six identity homes; verifies that the rollback archive is on a different
+filesystem; and renders both normal and rollback Compose models without
+starting anything. `validate` obtains the pinned public Hermes source
+automatically. See `pods/DEPLOY.md`, the only executable migration runbook, for
+state sync, auth seeding, cutover, rollback, and session-state recovery.
+
+Buzz relay and CLI paths are owned by each image-managed `config.yaml`.
+Compose does not duplicate them; a non-empty `BUZZ_RELAY_URL` or
+`BUZZ_CLI_PATH` environment value would explicitly override YAML.
 
 Secret examples under `pods/env/` map to
 `.runtime/secrets/hermes-pods/`. The four internal identity files are mounted

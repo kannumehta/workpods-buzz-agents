@@ -8,8 +8,6 @@ x-hermes-agent: &hermes-agent
     HOME: /opt/data/home
     CODEX_HOME: /opt/data/home/.codex
     HERMES_GATEWAY_BOOTSTRAP_STATE: running
-    BUZZ_RELAY_URL: https://beta-buzz.workpods.ai
-    BUZZ_CLI_PATH: /usr/local/bin/buzz
     BUZZ_UPLOAD_URL: http://buzz-relay-1:3000/upload
     BUZZ_UPLOAD_HOST: beta-buzz.workpods.ai
   restart: unless-stopped

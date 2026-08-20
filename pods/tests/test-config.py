@@ -23,6 +23,8 @@ def main() -> None:
         buzz = config.get("gateway", {}).get("platforms", {}).get("buzz")
         if buzz:
             assert buzz["extra"]["transport"] == "websocket", path
+            assert buzz["extra"]["relay_url"] == "https://beta-buzz.workpods.ai", path
+            assert buzz["extra"]["cli_path"] == "/usr/local/bin/buzz", path
 
     manifest = []
     for line in (PODS / "config/manifest.tsv").read_text(encoding="utf-8").splitlines():
@@ -42,6 +44,8 @@ def main() -> None:
     assert "HERMES_DASHBOARD" not in compose
     assert "9119" not in compose
     assert "email-management" not in compose
+    assert "BUZZ_RELAY_URL" not in compose
+    assert "BUZZ_CLI_PATH" not in compose
     assert "WORKPODS_BUILD_REVISION:?" in compose
 
 

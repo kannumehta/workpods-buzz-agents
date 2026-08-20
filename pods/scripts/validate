@@ -14,13 +14,33 @@ pods/tests/test-bootstrap.sh
 
 WORKPODS_BUILD_REVISION=validation docker compose \
   -f pods/compose.pods.yml config --quiet
+WORKPODS_BUILD_REVISION=validation docker compose \
+  -f pods/compose.pods.yml -f pods/hermes.rollback.yml config --quiet
 
 tmp=$(mktemp -d)
 cleanup() {
   rm -rf "$tmp" 2>/dev/null || sudo rm -rf "$tmp"
 }
 trap cleanup EXIT
-git -C "${HERMES_SOURCE_WORKTREE:-../hermes-agent-source}" archive \
+hermes_revision=3d7dda4cf42176d587b459345c56236a26030324
+if [[ -n "${HERMES_SOURCE_WORKTREE:-}" ]]; then
+  if ! hermes_source=$(realpath -e "$HERMES_SOURCE_WORKTREE") \
+    || ! git -C "$hermes_source" cat-file -e "$hermes_revision^{commit}" 2>/dev/null; then
+    printf 'Hermes source does not contain %s. Recreate it with:\n' "$hermes_revision" >&2
+    printf '  git clone https://github.com/NousResearch/hermes-agent.git %q\n' \
+      "$HERMES_SOURCE_WORKTREE" >&2
+    printf '  git -C %q fetch --depth=1 origin %s\n' \
+      "$HERMES_SOURCE_WORKTREE" "$hermes_revision" >&2
+    exit 66
+  fi
+else
+  hermes_source="$tmp/hermes-agent"
+  git -C "$tmp" init -q hermes-agent
+  git -C "$hermes_source" remote add origin \
+    https://github.com/NousResearch/hermes-agent.git
+  git -C "$hermes_source" fetch --depth=1 origin "$hermes_revision"
+fi
+git -C "$hermes_source" archive \
   3d7dda4cf42176d587b459345c56236a26030324 | tar -x -C "$tmp"
 git -C "$tmp" init -q
 git -C "$tmp" apply "$repo_root/pods/patches/hermes-agent-3d7dda4-buzz-attachments.patch"
