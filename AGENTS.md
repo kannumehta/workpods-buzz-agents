@@ -64,3 +64,27 @@ Use `buzz-acp/scripts/refresh-patches SOURCE_WORKTREE` only with a clean local
 Buzz worktree whose six commits descend from the revision in `UPSTREAM`. Use
 `rebase-upstream` to rehearse an upstream update without modifying the tracked
 series.
+
+## Hermes Pods
+
+`pods/` owns the reproducible, non-secret Hermes runtime for six Buzz
+identities: content, GEO, lifecycle, performance, marketing, and support desk.
+The internal container multiplexes the first four; it is not an identity.
+Kanban, `workpod`, public profiles, skills, and email-management MCP are not
+part of this runtime.
+
+Configuration and SOUL files are image-owned and reconciled by the bootstrap
+allowlist. USER files and all other state remain agent-owned. Do not add USER
+files, secrets, identities, sessions, or skills to the image context.
+
+Never deploy from a moving image tag. Build a unique revision tag, export the
+current rollback image, rehearse the bootstrap against a throwaway pre-copy,
+and obtain explicit deployment approval before changing live containers or
+state. Building and validation must not invoke `docker compose up`.
+
+Use `pods/scripts/build-image`; direct Docker builds may consume stale ignored
+Buzz artifacts. Compose intentionally has no build stanza. Before cutover,
+`pods/scripts/predeploy` must pass with `WORKPODS_ROLLBACK_ARCHIVE_ROOT` set to
+the checksum-verified cold archive. It also enforces six regular, non-symlink
+identity files with mode `0600`. Follow `pods/DEPLOY.md` for recovery; never
+delete a damaged ACP session mapping to make a restart succeed.

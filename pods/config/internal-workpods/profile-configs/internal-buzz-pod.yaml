@@ -1,0 +1,103 @@
+_config_version: 33
+
+model:
+  provider: openai-codex
+  default: gpt-5.5
+
+agent:
+  reasoning_effort: high
+  max_turns: 500
+  gateway_notify_interval: 0
+  session_stall_timeout: 0
+  api_max_retries: 2
+  environment_probe: false
+  task_completion_guidance: true
+  parallel_tool_call_guidance: true
+  verify_on_stop: false
+  disabled_toolsets:
+    - skills
+
+delegation:
+  max_iterations: 500
+
+terminal:
+  backend: local
+  cwd: /opt/data/workspace
+  home_mode: profile
+  timeout: 180
+
+display:
+  tool_progress: off
+  tool_progress_command: false
+  interim_assistant_messages: false
+  show_commentary: false
+  show_reasoning: false
+  turn_summary: false
+  credits_notices: false
+  final_response_markdown: strip
+
+compression:
+  enabled: true
+  progress_notices: false
+  codex_gpt55_autoraise: false
+  codex_gpt55_autoraise_notice: false
+  threshold: 0.50
+  target_ratio: 0.20
+  protect_last_n: 12
+  proactive_prune_tokens: 48000
+  micro_compact: false
+
+memory:
+  provider: ""
+
+curator:
+  enabled: false
+
+kanban:
+  dispatch_in_gateway: false
+
+mcp_servers:
+  composio:
+    url: ${COMPOSIO_MCP_URL}
+    headers:
+      x-api-key: ${COMPOSIO_API_KEY}
+    timeout: 120
+    connect_timeout: 60
+    keepalive_interval: 180
+  workpods:
+    url: https://beta-api.workpods.ai/mcp/
+    headers:
+      Authorization: Bearer ${WORKPODS_MCP_TOKEN}
+      X-WorkPods-Tool-Profile: "${WORKPODS_MCP_TOOL_PROFILE}"
+    timeout: 120
+    connect_timeout: 60
+    keepalive_interval: 180
+  workpods-semrush-mcp:
+    url: http://workpods-semrush-mcp:8000/mcp
+    timeout: 180
+    connect_timeout: 60
+  workpods-pagespeed-mcp:
+    url: http://workpods-pagespeed-mcp:8000/mcp/
+    headers:
+      Authorization: Bearer ${PAGESPEED_MCP_BEARER_TOKEN}
+    timeout: 180
+    connect_timeout: 60
+    keepalive_interval: 180
+
+gateway:
+  platforms:
+    buzz:
+      enabled: true
+      extra:
+        relay_url: https://beta-buzz.workpods.ai
+        channels:
+          - 3dd78a49-150a-5b05-b0ca-c3978c7e50af
+        home_channel: 3dd78a49-150a-5b05-b0ca-c3978c7e50af
+        transport: websocket
+        cli_path: /usr/local/bin/buzz
+        allow_all_users: false
+        require_mention: true
+
+security:
+  redact_secrets: true
+  protected_instruction_files: true

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  docker_cmd=(sudo docker)
+fi
+
+python3 pods/tests/test-config.py
+pods/tests/test-bootstrap.sh
+
+WORKPODS_BUILD_REVISION=validation docker compose \
+  -f pods/compose.pods.yml config --quiet
+
+tmp=$(mktemp -d)
+cleanup() {
+  rm -rf "$tmp" 2>/dev/null || sudo rm -rf "$tmp"
+}
+trap cleanup EXIT
+git -C "${HERMES_SOURCE_WORKTREE:-../hermes-agent-source}" archive \
+  3d7dda4cf42176d587b459345c56236a26030324 | tar -x -C "$tmp"
+git -C "$tmp" init -q
+git -C "$tmp" apply "$repo_root/pods/patches/hermes-agent-3d7dda4-buzz-attachments.patch"
+git -C "$tmp" apply "$repo_root/pods/patches/hermes-agent-3d7dda4-buzz-presence-typing.patch"
+"${docker_cmd[@]}" run --rm \
+  --entrypoint uv \
+  --volume "$tmp:/src" \
+  --workdir /src \
+  nousresearch/hermes-agent@sha256:d9d694eb78f1bb071605ea437b494a41e48764ed181ecb144f8b41cb545639df \
+  run --no-project --with pytest --with pytest-asyncio --with pynostr \
+    --with httpx --with websockets --with pyyaml --with cryptography \
+    pytest -q tests/gateway/test_buzz_websocket.py \
+      tests/gateway/test_buzz_adapter.py

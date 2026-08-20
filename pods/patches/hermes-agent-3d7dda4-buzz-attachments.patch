@@ -1,0 +1,526 @@
+diff --git a/plugins/platforms/buzz/adapter.py b/plugins/platforms/buzz/adapter.py
+index 8b77ae3..bfd001a 100644
+--- a/plugins/platforms/buzz/adapter.py
++++ b/plugins/platforms/buzz/adapter.py
+@@ -37,17 +37,22 @@ environment and is never logged.
+ """
+ 
+ import asyncio
++import base64
++import hashlib
+ import json
+ import logging
++import mimetypes
+ import os
+ import re
+ import shutil
+ import time
++import urllib.error
++import urllib.request
+ from collections import OrderedDict
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple
+-from urllib.parse import urlsplit, urlunsplit
++from urllib.parse import unquote, urlsplit, urlunsplit
+ 
+ from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+ from agent.secret_scope import get_secret as _scoped_get_secret
+@@ -99,6 +104,8 @@ _DM_DISCOVERY_EVERY = 5
+ _DEFAULT_POLL_INTERVAL = 4.0
+ _MIN_POLL_INTERVAL = 1.0
+ _CLI_TIMEOUT = 30.0
++_MEDIA_CLI_TIMEOUT = 180.0
++_MEDIA_CACHE_DIR = "buzz-media"
+ 
+ # WebSocket transport (NIP-42 authenticated Nostr subscription).
+ # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
+@@ -344,6 +351,50 @@ def _parse_json_list(stdout: str) -> List[dict]:
+     return [item for item in data if isinstance(item, dict)]
+ 
+ 
++def _safe_media_filename(filename: str, fallback: str) -> str:
++    """Return a cache filename without path separators or control chars."""
++    name = unquote(filename or "").strip() or fallback
++    name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
++    name = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip(" .")
++    return name[:180] or fallback
++
++
++def _parse_imeta_tags(tags: Any) -> List[Dict[str, str]]:
++    """Extract NIP-92 imeta fields from Buzz event tags."""
++    items: List[Dict[str, str]] = []
++    if not isinstance(tags, list):
++        return items
++    for tag in tags:
++        if not isinstance(tag, list) or not tag or tag[0] != "imeta":
++            continue
++        entry: Dict[str, str] = {}
++        for part in tag[1:]:
++            if not isinstance(part, str) or " " not in part:
++                continue
++            key, value = part.split(" ", 1)
++            key = key.strip().lower()
++            value = value.strip()
++            if key and value:
++                entry[key] = value
++        if entry.get("url"):
++            items.append(entry)
++    return items
++
++
++def _message_type_for_media(media_types: List[str]) -> MessageType:
++    """Choose the Hermes message type for a set of downloaded media files."""
++    lowered = [(m or "").lower() for m in media_types]
++    if any(m and not m.startswith(("image/", "video/", "audio/")) for m in lowered):
++        return MessageType.DOCUMENT
++    if any(m.startswith("image/") for m in lowered):
++        return MessageType.PHOTO
++    if any(m.startswith("video/") for m in lowered):
++        return MessageType.VIDEO
++    if any(m.startswith("audio/") for m in lowered):
++        return MessageType.AUDIO
++    return MessageType.DOCUMENT if media_types else MessageType.TEXT
++
++
+ # ---------------------------------------------------------------------------
+ # Buzz Adapter
+ # ---------------------------------------------------------------------------
+@@ -443,7 +494,13 @@ class BuzzAdapter(BasePlatformAdapter):
+ 
+     # ── buzz-cli plumbing ─────────────────────────────────────────────────
+ 
+-    async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
++    async def _run_cli(
++        self,
++        args: List[str],
++        *,
++        input_text: Optional[str] = None,
++        timeout: float = _CLI_TIMEOUT,
++    ) -> Tuple[int, str, str]:
+         if not self._private_key:
+             self._private_key = _resolve_private_key(self._extra)
+         return await _exec_buzz(
+@@ -452,6 +509,7 @@ class BuzzAdapter(BasePlatformAdapter):
+             relay_url=self.relay_url,
+             private_key=self._private_key,
+             input_text=input_text,
++            timeout=timeout,
+         )
+ 
+     # ── Connection lifecycle ──────────────────────────────────────────────
+@@ -664,6 +722,159 @@ class BuzzAdapter(BasePlatformAdapter):
+             return False
+         return True
+ 
++    def _relay_http_url(self, path: str) -> str:
++        parsed = urlsplit(self.relay_url.strip())
++        scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
++        base_path = (parsed.path or "").rstrip("/")
++        return urlunsplit((scheme, parsed.netloc, f"{base_path}{path}", "", ""))
++
++    def _signed_nostr_event(self, kind: int, tags: List[List[str]], content: str) -> dict:
++        if not self._private_key:
++            self._private_key = _resolve_private_key(self._extra)
++        nostr_auth = _load_nostr_auth()
++        pubkey = nostr_auth.public_key_hex(self._private_key)
++        created_at = int(time.time())
++        serialized = json.dumps(
++            [0, pubkey, created_at, kind, tags, content],
++            separators=(",", ":"),
++            ensure_ascii=False,
++        ).encode("utf-8")
++        event_id = hashlib.sha256(serialized).digest()
++        return {
++            "id": event_id.hex(),
++            "pubkey": pubkey,
++            "created_at": created_at,
++            "kind": kind,
++            "tags": tags,
++            "content": content,
++            "sig": nostr_auth.schnorr_sign(event_id, self._private_key).hex(),
++        }
++
++    def _blossom_upload_auth_header(self, sha256: str, mime_type: str) -> str:
++        tags = [
++            ["t", "upload"],
++            ["x", sha256],
++            ["expiration", str(int(time.time()) + (3600 if mime_type.startswith("video/") else 600))],
++        ]
++        parsed = urlsplit(self.relay_url.strip())
++        if parsed.netloc:
++            tags.append(["server", parsed.netloc])
++        event = self._signed_nostr_event(24242, tags, "Upload file")
++        encoded = base64.urlsafe_b64encode(
++            json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
++        ).decode("ascii").rstrip("=")
++        return f"Nostr {encoded}"
++
++    def _upload_generic_file_sync(self, local: Path) -> Dict[str, Any]:
++        data = local.read_bytes()
++        mime_type = mimetypes.guess_type(local.name)[0] or "application/octet-stream"
++        sha256 = hashlib.sha256(data).hexdigest()
++        upload_url = os.getenv("BUZZ_UPLOAD_URL", "").strip() or self._relay_http_url("/upload")
++        upload_host = os.getenv("BUZZ_UPLOAD_HOST", "").strip()
++        headers = {
++            "Authorization": self._blossom_upload_auth_header(sha256, mime_type),
++            "Content-Type": mime_type,
++            "Content-Length": str(len(data)),
++            "X-SHA-256": sha256,
++        }
++        if upload_host:
++            headers["Host"] = upload_host
++        request = urllib.request.Request(
++            upload_url,
++            data=data,
++            method="PUT",
++            headers=headers,
++        )
++        try:
++            with urllib.request.urlopen(request, timeout=_MEDIA_CLI_TIMEOUT) as response:
++                body = response.read().decode("utf-8", errors="replace")
++        except urllib.error.HTTPError as e:
++            detail = e.read().decode("utf-8", errors="replace")
++            raise RuntimeError(f"generic upload failed: HTTP {e.code} {detail}") from e
++        except urllib.error.URLError as e:
++            raise RuntimeError(f"generic upload failed: {e}") from e
++        try:
++            descriptor = json.loads(body or "{}")
++        except ValueError as e:
++            raise RuntimeError(f"generic upload returned non-JSON response: {body[:200]}") from e
++        if not isinstance(descriptor, dict) or not descriptor.get("url"):
++            raise RuntimeError(f"generic upload returned no media URL: {body[:200]}")
++        return descriptor
++
++    async def _send_generic_file_link(
++        self,
++        chat_id: str,
++        local: Path,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> SendResult:
++        try:
++            descriptor = await asyncio.to_thread(self._upload_generic_file_sync, local)
++        except Exception as e:
++            return SendResult(success=False, error=str(e), retryable=False)
++        url = str(descriptor.get("url") or "")
++        label = local.name
++        text = f"[{label}]({url})"
++        if caption:
++            text = f"{caption}\n{text}"
++        result = await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
++        if result.raw_response is None:
++            result.raw_response = {}
++        if isinstance(result.raw_response, dict):
++            result.raw_response["upload"] = descriptor
++        return result
++
++    async def _send_local_file_upload(
++        self,
++        chat_id: str,
++        file_path: str,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++    ) -> Optional[SendResult]:
++        """Upload an existing local file through Buzz's native --file path."""
++        local = Path(file_path).expanduser()
++        if not local.is_file():
++            return None
++        args = [
++            "messages", "send",
++            "--channel", str(chat_id),
++            "--file", str(local),
++            "--content", "-",
++        ]
++        reply_target = reply_to or (metadata or {}).get("thread_id")
++        if reply_target:
++            args += ["--reply-to", str(reply_target)]
++        code, out, err = await self._run_cli(
++            args,
++            input_text=caption or "",
++            timeout=_MEDIA_CLI_TIMEOUT,
++        )
++        if code != 0:
++            message = _cli_error_message(err, code)
++            if "unsupported file type:" in message:
++                return await self._send_generic_file_link(
++                    chat_id=chat_id,
++                    local=local,
++                    caption=caption,
++                    reply_to=reply_to,
++                    metadata=metadata,
++                )
++            return SendResult(success=False, error=message, retryable=code == 2)
++        try:
++            data = json.loads(out or "{}")
++        except ValueError:
++            data = {}
++        event_id = data.get("event_id")
++        if event_id:
++            self._mark_seen(str(chat_id), str(event_id))
++        return SendResult(
++            success=bool(data.get("accepted", True)),
++            message_id=str(event_id) if event_id else None,
++            raw_response=data,
++        )
++
+     async def send_image(
+         self,
+         chat_id: str,
+@@ -674,34 +879,96 @@ class BuzzAdapter(BasePlatformAdapter):
+     ) -> SendResult:
+         """Send an image: local files upload via --file, URLs go as a link."""
+         local = Path(image_url).expanduser() if not image_url.startswith(("http://", "https://")) else None
+-        if local is not None and local.is_file():
+-            args = [
+-                "messages", "send",
+-                "--channel", str(chat_id),
+-                "--file", str(local),
+-                "--content", "-",
+-            ]
+-            if reply_to:
+-                args += ["--reply-to", str(reply_to)]
+-            code, out, err = await self._run_cli(args, input_text=caption or "")
+-            if code != 0:
+-                return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
+-            try:
+-                data = json.loads(out or "{}")
+-            except ValueError:
+-                data = {}
+-            event_id = data.get("event_id")
+-            if event_id:
+-                self._mark_seen(str(chat_id), str(event_id))
+-            return SendResult(
+-                success=bool(data.get("accepted", True)),
+-                message_id=str(event_id) if event_id else None,
+-                raw_response=data,
++        if local is not None:
++            uploaded = await self._send_local_file_upload(
++                chat_id=chat_id,
++                file_path=str(local),
++                caption=caption,
++                reply_to=reply_to,
++                metadata=metadata,
+             )
++            if uploaded is not None:
++                return uploaded
+         # Markdown renders in Buzz, so a URL arrives as a clickable image link.
+         text = f"{caption}\n{image_url}" if caption else image_url
+         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+ 
++    async def send_image_file(
++        self,
++        chat_id: str,
++        image_path: str,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        **kwargs,
++    ) -> SendResult:
++        uploaded = await self._send_local_file_upload(chat_id, image_path, caption, reply_to, metadata)
++        if uploaded is not None:
++            return uploaded
++        return await super().send_image_file(chat_id, image_path, caption, reply_to, metadata, **kwargs)
++
++    async def send_document(
++        self,
++        chat_id: str,
++        file_path: str,
++        caption: Optional[str] = None,
++        file_name: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        **kwargs,
++    ) -> SendResult:
++        uploaded = await self._send_local_file_upload(chat_id, file_path, caption, reply_to, metadata)
++        if uploaded is not None:
++            return uploaded
++        return await super().send_document(
++            chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to, metadata=metadata, **kwargs
++        )
++
++    async def send_video(
++        self,
++        chat_id: str,
++        video_path: str,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        **kwargs,
++    ) -> SendResult:
++        uploaded = await self._send_local_file_upload(chat_id, video_path, caption, reply_to, metadata)
++        if uploaded is not None:
++            return uploaded
++        if video_path.startswith(("http://", "https://")):
++            text = f"{caption}\n{video_path}" if caption else video_path
++            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
++        return await super().send_video(chat_id, video_path, caption, reply_to, metadata, **kwargs)
++
++    async def send_audio(
++        self,
++        chat_id: str,
++        audio_path: str,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        **kwargs,
++    ) -> SendResult:
++        return await self.send_voice(chat_id, audio_path, caption, reply_to, metadata, **kwargs)
++
++    async def send_voice(
++        self,
++        chat_id: str,
++        audio_path: str,
++        caption: Optional[str] = None,
++        reply_to: Optional[str] = None,
++        metadata: Optional[Dict[str, Any]] = None,
++        **kwargs,
++    ) -> SendResult:
++        uploaded = await self._send_local_file_upload(chat_id, audio_path, caption, reply_to, metadata)
++        if uploaded is not None:
++            return uploaded
++        if audio_path.startswith(("http://", "https://")):
++            text = f"{caption}\n{audio_path}" if caption else audio_path
++            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
++        return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata, **kwargs)
++
+     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+         chat_id = str(chat_id)
+         state = self._channel_state.get(chat_id)
+@@ -719,6 +986,75 @@ class BuzzAdapter(BasePlatformAdapter):
+                     pass
+         return {"name": name or chat_id, "type": chat_type, "chat_id": chat_id}
+ 
++    def _media_cache_dir(self) -> Path:
++        base = Path(os.getenv("HERMES_HOME") or Path.home()).expanduser()
++        cache_dir = base / "cache" / _MEDIA_CACHE_DIR
++        cache_dir.mkdir(parents=True, exist_ok=True)
++        return cache_dir
++
++    async def _download_imeta_media(
++        self,
++        event_id: str,
++        entries: List[Dict[str, str]],
++    ) -> Tuple[List[str], List[str]]:
++        """Download Buzz imeta attachments into the Hermes profile cache."""
++        media_urls: List[str] = []
++        media_types: List[str] = []
++        for index, entry in enumerate(entries):
++            url = entry.get("url", "").strip()
++            if not url:
++                continue
++            mime_type = entry.get("m", "").strip()
++            parsed = urlsplit(url)
++            url_name = Path(unquote(parsed.path)).name
++            ext = Path(url_name).suffix
++            if not ext and mime_type:
++                ext = mimetypes.guess_extension(mime_type.split(";", 1)[0].strip()) or ""
++            digest = re.sub(r"[^0-9a-fA-F]", "", entry.get("x", ""))[:16]
++            fallback = f"{digest or event_id[:12]}-{index}{ext or '.bin'}"
++            safe_name = _safe_media_filename(entry.get("filename") or url_name, fallback)
++            if digest and not safe_name.startswith(digest):
++                safe_name = f"{digest}-{safe_name}"
++            target = self._media_cache_dir() / safe_name
++
++            expected_size: Optional[int] = None
++            try:
++                expected_size = int(entry.get("size", "") or "0") or None
++            except ValueError:
++                expected_size = None
++            try:
++                if target.is_file() and (expected_size is None or target.stat().st_size == expected_size):
++                    media_urls.append(str(target))
++                    media_types.append(mime_type or mimetypes.guess_type(target.name)[0] or "")
++                    continue
++            except OSError:
++                pass
++
++            tmp = target.with_name(f".{target.name}.part")
++            code, _out, err = await self._run_cli(
++                ["media", "get", url, "-o", str(tmp)],
++                timeout=_MEDIA_CLI_TIMEOUT,
++            )
++            if code != 0:
++                logger.warning(
++                    "Buzz: failed to download media attachment for event %s — %s",
++                    event_id[:12],
++                    _cli_error_message(err, code),
++                )
++                try:
++                    tmp.unlink(missing_ok=True)
++                except OSError:
++                    pass
++                continue
++            try:
++                tmp.replace(target)
++            except OSError as e:
++                logger.warning("Buzz: failed to finalize media attachment cache file: %s", e)
++                continue
++            media_urls.append(str(target))
++            media_types.append(mime_type or mimetypes.guess_type(target.name)[0] or "")
++        return media_urls, media_types
++
+     # ── Inbound: WebSocket transport (NIP-42 authenticated) ──────────────
+     #
+     # Push transport contributed in PR #73636 by @ScaleLeanChris, adapted to
+@@ -1017,8 +1353,10 @@ class BuzzAdapter(BasePlatformAdapter):
+         if int(event.get("kind") or 0) != _CHAT_KIND:
+             return
+         pubkey = str(event.get("pubkey") or "").lower()
+-        content = event.get("content")
+-        if not pubkey or not isinstance(content, str) or not content.strip():
++        raw_content = event.get("content")
++        content = raw_content if isinstance(raw_content, str) else ""
++        imeta_entries = _parse_imeta_tags(event.get("tags"))
++        if not pubkey or (not content.strip() and not imeta_entries):
+             return
+ 
+         # Suppress self-echo: never dispatch our own messages back to the agent.
+@@ -1047,6 +1385,9 @@ class BuzzAdapter(BasePlatformAdapter):
+         # open with "@Chip" even though no mention is required there, so the
+         # strip applies to both chat types.
+         dispatch_text = self._strip_mention(content)
++        media_urls, media_types = await self._download_imeta_media(event_id, imeta_entries)
++        if imeta_entries and not media_urls and not dispatch_text.strip():
++            dispatch_text = "[Buzz attachment could not be downloaded.]"
+ 
+         await self._dispatch_message(
+             text=dispatch_text,
+@@ -1056,6 +1397,9 @@ class BuzzAdapter(BasePlatformAdapter):
+             user_name=await self._resolve_user_name(pubkey),
+             message_id=event_id,
+             created_at=created_at,
++            media_urls=media_urls,
++            media_types=media_types,
++            raw_message=event,
+         )
+ 
+     # ── DM classification (issue #68871) ──────────────────────────────────
+@@ -1219,6 +1563,9 @@ class BuzzAdapter(BasePlatformAdapter):
+         user_name: str,
+         message_id: str,
+         created_at: int,
++        media_urls: Optional[List[str]] = None,
++        media_types: Optional[List[str]] = None,
++        raw_message: Optional[dict] = None,
+     ) -> None:
+         """Build a MessageEvent and hand it to the base class handler."""
+         if not self._message_handler:
+@@ -1234,9 +1581,14 @@ class BuzzAdapter(BasePlatformAdapter):
+ 
+         event = MessageEvent(
+             text=text,
+-            message_type=MessageType.TEXT,
++            message_type=_message_type_for_media(media_types or []),
+             source=source,
++            user_id=user_id,
++            user_name=user_name,
++            raw_message=raw_message,
+             message_id=message_id,
++            media_urls=media_urls or [],
++            media_types=media_types or [],
+             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
+         )
+ 

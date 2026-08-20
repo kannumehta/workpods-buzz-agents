@@ -1,0 +1,10 @@
+services:
+  hermes-internal-workpods:
+    image: workpods/hermes-codex:rollback-bc2171345764
+    entrypoint: ["/opt/hermes/docker/entrypoint-dispatch.sh"]
+  hermes-marketing-pod:
+    image: workpods/hermes-codex:rollback-bc2171345764
+    entrypoint: ["/opt/hermes/docker/entrypoint-dispatch.sh"]
+  hermes-support-desk-pod:
+    image: workpods/hermes-codex:rollback-bc2171345764
+    entrypoint: ["/opt/hermes/docker/entrypoint-dispatch.sh"]

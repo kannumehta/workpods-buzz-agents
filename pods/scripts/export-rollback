@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  printf 'usage: %s SOURCE_IMAGE ARCHIVE_ROOT\n' "$0" >&2
+  exit 2
+fi
+
+source_image=$1
+archive_root=$2
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null
+  docker_cmd=(sudo -n docker)
+fi
+
+image_id=$("${docker_cmd[@]}" image inspect "$source_image" --format '{{.Id}}')
+short=${image_id#sha256:}
+short=${short:0:12}
+tag="workpods/hermes-codex:rollback-$short"
+archive="$archive_root/hermes-codex-rollback-$short.tar"
+checksum="$archive.sha256"
+tmp="$archive.tmp.$$"
+trap 'rm -f -- "$tmp"' EXIT
+
+install -d -m 0700 "$archive_root"
+test ! -e "$archive"
+test ! -e "$checksum"
+"${docker_cmd[@]}" image tag "$image_id" "$tag"
+"${docker_cmd[@]}" image save -o "$tmp" "$tag"
+if [[ ! -O "$tmp" ]]; then
+  sudo -n chown "$(id -u):$(id -g)" "$tmp"
+fi
+chmod 0600 "$tmp"
+mv "$tmp" "$archive"
+sha256sum "$archive" > "$checksum"
+chmod 0600 "$checksum"
+(cd "$archive_root" && sha256sum -c "$(basename "$checksum")")
+trap - EXIT
+printf 'tag=%s\narchive=%s\nchecksum=%s\n' "$tag" "$archive" "$checksum"

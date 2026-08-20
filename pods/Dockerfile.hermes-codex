@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+FROM nousresearch/hermes-agent@sha256:d9d694eb78f1bb071605ea437b494a41e48764ed181ecb144f8b41cb545639df
+
+ARG BUZZ_PATCH_HEAD=unknown
+ARG BUZZ_PATCH_TREE=unknown
+
+USER root
+RUN npm pack https://registry.npmjs.org/@openai/codex/-/codex-0.147.0.tgz --pack-destination /tmp >/dev/null \
+    && node -e 'const fs=require("fs"),c=require("crypto"); const p="/tmp/openai-codex-0.147.0.tgz"; const h=c.createHash("sha512").update(fs.readFileSync(p)).digest("base64"); if(h!=="EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w==") process.exit(1)' \
+    && npm install --global /tmp/openai-codex-0.147.0.tgz \
+    && rm -f /tmp/openai-codex-0.147.0.tgz \
+    && codex --version | grep -F '0.147.0'
+
+COPY buzz-acp/dist/buzz /usr/local/bin/buzz
+COPY buzz-acp/dist/SHA256SUMS /tmp/buzz-SHA256SUMS
+COPY buzz-acp/dist/provenance.json /opt/workpods/buzz-build-provenance.json
+RUN chmod 0755 /usr/local/bin/buzz \
+    && python3 -c 'import json; p=json.load(open("/opt/workpods/buzz-build-provenance.json")); assert p["patch_head"] == "'"$BUZZ_PATCH_HEAD"'"; assert p["patched_tree"] == "'"$BUZZ_PATCH_TREE"'"' \
+    && expected="$(awk '$2 == "buzz" { print $1 }' /tmp/buzz-SHA256SUMS)" \
+    && test -n "$expected" \
+    && printf '%s  %s\n' "$expected" /usr/local/bin/buzz | sha256sum -c -
+
+COPY pods/patches/hermes-agent-3d7dda4-buzz-attachments.patch /tmp/attachments.patch
+COPY pods/patches/hermes-agent-3d7dda4-buzz-presence-typing.patch /tmp/presence-typing.patch
+RUN cd /opt/hermes \
+    && git apply --check /tmp/attachments.patch \
+    && git apply /tmp/attachments.patch \
+    && git apply --check --include=plugins/platforms/buzz/adapter.py /tmp/presence-typing.patch \
+    && git apply --include=plugins/platforms/buzz/adapter.py /tmp/presence-typing.patch \
+    && .venv/bin/python -m py_compile plugins/platforms/buzz/adapter.py
+
+COPY pods/config /opt/workpods/hermes-config
+COPY pods/config/manifest.tsv /opt/workpods/config-manifest.tsv
+COPY pods/scripts/bootstrap /usr/local/bin/workpods-hermes-bootstrap
+RUN chmod 0755 /usr/local/bin/workpods-hermes-bootstrap \
+    && find /opt/workpods/hermes-config -type f -exec chmod 0644 {} +
+
+ENTRYPOINT ["/usr/local/bin/workpods-hermes-bootstrap"]
+
+ARG WORKPODS_BUILD_REVISION=unknown
+LABEL org.opencontainers.image.revision="${WORKPODS_BUILD_REVISION}" \
+      io.workpods.buzz.patch-head="${BUZZ_PATCH_HEAD}" \
+      io.workpods.buzz.patch-tree="${BUZZ_PATCH_TREE}" \
+      io.workpods.hermes.upstream-revision="3d7dda4cf42176d587b459345c56236a26030324" \
+      io.workpods.hermes.upstream-image="nousresearch/hermes-agent@sha256:d9d694eb78f1bb071605ea437b494a41e48764ed181ecb144f8b41cb545639df"

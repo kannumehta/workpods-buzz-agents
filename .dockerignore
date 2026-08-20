@@ -1,0 +1,15 @@
+**
+!buzz-acp/
+!buzz-acp/dist/
+!buzz-acp/dist/buzz
+!buzz-acp/dist/SHA256SUMS
+!buzz-acp/dist/provenance.json
+!pods/
+!pods/Dockerfile.hermes-codex
+!pods/config/
+!pods/config/**
+!pods/patches/
+!pods/patches/hermes-agent-3d7dda4-buzz-attachments.patch
+!pods/patches/hermes-agent-3d7dda4-buzz-presence-typing.patch
+!pods/scripts/
+!pods/scripts/bootstrap

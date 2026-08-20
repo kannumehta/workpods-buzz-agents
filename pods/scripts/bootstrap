@@ -1,0 +1,157 @@
+#!/bin/sh
+set -eu
+
+CONFIG_ROOT=${WORKPODS_HERMES_CONFIG_ROOT:-/opt/workpods/hermes-config}
+MANIFEST=${WORKPODS_HERMES_CONFIG_MANIFEST:-/opt/workpods/config-manifest.tsv}
+DEST_ROOT=${HERMES_HOME:-/opt/data}
+CONFIG_SET=${WORKPODS_HERMES_CONFIG_SET:-}
+CHECK_ONLY=false
+
+if [ "${1:-}" = "--check-only" ]; then
+    CHECK_ONLY=true
+    shift
+fi
+
+case "$CONFIG_SET" in
+    internal-workpods|marketing-pod|support-desk-pod) ;;
+    *) echo "Invalid WORKPODS_HERMES_CONFIG_SET" >&2; exit 64 ;;
+esac
+
+case "$DEST_ROOT" in
+    /*) ;;
+    *) echo "HERMES_HOME must be absolute" >&2; exit 64 ;;
+esac
+
+validate_relative() {
+    case "$1" in
+        ""|/*|..|../*|*/../*|*/..) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+atomic_file() {
+    src=$1 dest=$2 mode=$3
+    display_mode=${mode#0}
+    src_hash=$(sha256sum "$src" | awk '{print $1}')
+    old_hash=missing
+    if [ -f "$dest" ] && [ ! -L "$dest" ]; then
+        old_hash=$(sha256sum "$dest" | awk '{print $1}')
+    fi
+    if [ "$src_hash" = "$old_hash" ] \
+        && [ "$(stat -c '%a' "$dest")" = "$display_mode" ] \
+        && [ "$(stat -c '%u:%g' "$dest")" = '10000:10000' ]; then
+        return
+    fi
+    tmp="${dest}.workpods.$$"
+    rm -f "$tmp"
+    install -m "$mode" "$src" "$tmp"
+    chown 10000:10000 "$tmp"
+    mv -f "$tmp" "$dest"
+    echo "reconciled $dest old=$old_hash new=$src_hash"
+}
+
+atomic_marker() {
+    dest=$1 mode=$2
+    display_mode=${mode#0}
+    if [ -f "$dest" ] && [ ! -L "$dest" ] && [ ! -s "$dest" ] \
+        && [ "$(stat -c '%a' "$dest")" = "$display_mode" ] \
+        && [ "$(stat -c '%u:%g' "$dest")" = '10000:10000' ]; then
+        return
+    fi
+    tmp="${dest}.workpods.$$"
+    rm -f "$tmp"
+    : > "$tmp"
+    chmod "$mode" "$tmp"
+    chown 10000:10000 "$tmp"
+    mv -f "$tmp" "$dest"
+    echo "reconciled $dest marker"
+}
+
+atomic_symlink() {
+    target=$1 dest=$2
+    if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$target" ] \
+        && [ "$(stat -c '%u:%g' "$dest")" = '10000:10000' ]; then
+        return
+    fi
+    tmp="${dest}.workpods.$$"
+    rm -f "$tmp"
+    ln -s "$target" "$tmp"
+    mv -f "$tmp" "$dest"
+    chown -h 10000:10000 "$dest"
+    echo "reconciled $dest symlink"
+}
+
+ensure_parent() {
+    parent=$1
+    mkdir -p "$parent"
+    root_real=$(realpath "$DEST_ROOT")
+    parent_real=$(realpath "$parent")
+    case "$parent_real" in
+        "$root_real"|"$root_real"/*) ;;
+        *) echo "Destination parent escapes HERMES_HOME: $parent" >&2; exit 65 ;;
+    esac
+    chown 10000:10000 "$parent"
+}
+
+[ -r "$MANIFEST" ] || { echo "Unreadable config manifest" >&2; exit 66; }
+[ -d "$CONFIG_ROOT" ] || { echo "Missing config root" >&2; exit 66; }
+mkdir -p "$DEST_ROOT"
+
+seen=$(mktemp)
+trap 'rm -f "$seen"' EXIT HUP INT TERM
+
+while IFS="$(printf '\t')" read -r set kind mode source dest extra; do
+    case "$set" in ""|'#'*) continue ;; esac
+    [ -z "${extra:-}" ] || { echo "Malformed manifest row" >&2; exit 65; }
+    [ "$set" = "$CONFIG_SET" ] || continue
+    validate_relative "$dest" || { echo "Unsafe destination: $dest" >&2; exit 65; }
+    if grep -Fxq "$dest" "$seen"; then
+        echo "Duplicate destination: $dest" >&2
+        exit 65
+    fi
+    printf '%s\n' "$dest" >> "$seen"
+    parent=$DEST_ROOT/$(dirname "$dest")
+    ensure_parent "$parent"
+    target=$DEST_ROOT/$dest
+    case "$kind" in
+        file)
+            validate_relative "$source" || { echo "Unsafe source: $source" >&2; exit 65; }
+            [ -f "$CONFIG_ROOT/$source" ] || { echo "Missing source: $source" >&2; exit 66; }
+            atomic_file "$CONFIG_ROOT/$source" "$target" "$mode"
+            ;;
+        marker)
+            [ "$source" = '-' ] || { echo "Marker has source" >&2; exit 65; }
+            atomic_marker "$target" "$mode"
+            ;;
+        symlink)
+            [ "$source" = '../../profile-configs/internal-buzz-pod.yaml' ] \
+                || { echo "Unsafe symlink target: $source" >&2; exit 65; }
+            atomic_symlink "$source" "$target"
+            ;;
+        *) echo "Unknown manifest kind: $kind" >&2; exit 65 ;;
+    esac
+done < "$MANIFEST"
+
+[ -s "$seen" ] || { echo "No manifest entries for $CONFIG_SET" >&2; exit 65; }
+
+if find "$DEST_ROOT" -type f -name SKILL.md -print -quit | grep -q .; then
+    echo "SKILL.md remains under $DEST_ROOT" >&2
+    exit 78
+fi
+
+case "$CONFIG_SET" in
+    internal-workpods)
+        for marker in \
+            .no-bundled-skills \
+            profiles/content-pod/.no-bundled-skills \
+            profiles/geo-pod/.no-bundled-skills \
+            profiles/lifecycle-pod/.no-bundled-skills \
+            profiles/performance-pod/.no-bundled-skills; do
+            [ -f "$DEST_ROOT/$marker" ] || { echo "Missing marker: $marker" >&2; exit 78; }
+        done
+        ;;
+    *) [ -f "$DEST_ROOT/.no-bundled-skills" ] || { echo "Missing skill opt-out marker" >&2; exit 78; } ;;
+esac
+
+$CHECK_ONLY && exit 0
+exec /opt/hermes/docker/entrypoint-dispatch.sh "$@"

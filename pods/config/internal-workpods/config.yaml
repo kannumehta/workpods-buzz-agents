@@ -1,0 +1,64 @@
+_config_version: 33
+
+model:
+  provider: openai-codex
+  default: gpt-5.5
+
+agent:
+  reasoning_effort: high
+  max_turns: 500
+  gateway_notify_interval: 0
+  session_stall_timeout: 0
+  api_max_retries: 2
+  environment_probe: false
+  task_completion_guidance: true
+  parallel_tool_call_guidance: true
+  verify_on_stop: false
+  disabled_toolsets:
+    - skills
+
+delegation:
+  max_iterations: 500
+
+terminal:
+  backend: local
+  cwd: /opt/data/workspace
+  home_mode: profile
+  timeout: 180
+
+display:
+  tool_progress: off
+  tool_progress_command: false
+  interim_assistant_messages: false
+  show_commentary: false
+  show_reasoning: false
+  turn_summary: false
+  credits_notices: false
+  final_response_markdown: strip
+
+compression:
+  enabled: true
+  progress_notices: false
+  codex_gpt55_autoraise: false
+  codex_gpt55_autoraise_notice: false
+  threshold: 0.50
+  target_ratio: 0.20
+  protect_last_n: 12
+  proactive_prune_tokens: 48000
+  micro_compact: false
+
+memory:
+  provider: ""
+
+curator:
+  enabled: false
+
+kanban:
+  dispatch_in_gateway: false
+
+gateway:
+  multiplex_profiles: true
+
+security:
+  redact_secrets: true
+  protected_instruction_files: true

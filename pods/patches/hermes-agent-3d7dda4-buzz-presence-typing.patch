@@ -1,0 +1,413 @@
+From 28ede267d611372d9f32a793764170b0952c50c1 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Thu, 20 Aug 2026 00:40:18 +0000
+Subject: [PATCH] Publish Buzz presence and typing over WebSocket
+
+Signed-off-by: Musketeer <musketeer@example.com>
+---
+ plugins/platforms/buzz/adapter.py    | 146 +++++++++++++++++++-----
+ tests/gateway/test_buzz_adapter.py   |   3 +-
+ tests/gateway/test_buzz_websocket.py | 163 +++++++++++++++++++++++++++
+ 3 files changed, 279 insertions(+), 33 deletions(-)
+
+diff --git a/plugins/platforms/buzz/adapter.py b/plugins/platforms/buzz/adapter.py
+index 06a3b5dd4..890dd6922 100644
+--- a/plugins/platforms/buzz/adapter.py
++++ b/plugins/platforms/buzz/adapter.py
+@@ -113,6 +113,9 @@ _WS_AUTH_TIMEOUT = 20.0
+ _WS_MAX_MESSAGE_BYTES = 2_000_000
+ _WS_MEMBERSHIP_KIND = 44100
+ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
++_WS_PRESENCE_KIND = 20001
++_WS_TYPING_KIND = 20002
++_WS_PRESENCE_REFRESH_SECONDS = 60.0
+ 
+ # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
+ # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
+@@ -477,6 +480,9 @@ class BuzzAdapter(BasePlatformAdapter):
+         self._ws_task: Optional[asyncio.Task] = None
+         self._ws_ready: Optional[asyncio.Event] = None
+         self._ws_active = False  # True while the WS loop owns inbound delivery
++        self._ws_socket = None
++        self._ws_send_lock = asyncio.Lock()
++        self._presence_task: Optional[asyncio.Task] = None
+         self._membership_since = 0
+         self._lock_key: Optional[str] = None
+         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
+@@ -693,8 +699,29 @@ class BuzzAdapter(BasePlatformAdapter):
+         )
+ 
+     async def send_typing(self, chat_id: str, metadata=None) -> None:
+-        """Buzz has no typing indicator API — no-op."""
+-        pass
++        """Publish a short-lived Buzz typing event on the authenticated socket."""
++        websocket = self._ws_socket
++        if not self._ws_active or websocket is None:
++            return
++        tags = [["h", str(chat_id)]]
++        metadata = metadata or {}
++        root = metadata.get("root_event_id")
++        parent = (
++            metadata.get("parent_event_id")
++            or metadata.get("reply_to_message_id")
++            or metadata.get("thread_id")
++        )
++        if root and root != parent:
++            tags.append(["e", str(root), "", "root"])
++        if parent:
++            tags.append(["e", str(parent), "", "reply"])
++        try:
++            await self._publish_websocket_event(
++                websocket,
++                self._signed_nostr_event(_WS_TYPING_KIND, tags, ""),
++            )
++        except Exception:
++            logger.debug("Buzz: typing indicator publish failed", exc_info=True)
+ 
+     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+         """Add a reaction to a message via buzz-cli.
+@@ -1140,7 +1167,43 @@ class BuzzAdapter(BasePlatformAdapter):
+             subscription_id,
+             {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
+         ]
+-        await websocket.send(json.dumps(request, separators=(",", ":")))
++        await self._send_websocket_frame(websocket, request)
++
++    async def _send_websocket_frame(self, websocket, frame: list) -> None:
++        """Serialize writes shared by subscriptions, presence, and typing."""
++        async with self._ws_send_lock:
++            await websocket.send(json.dumps(frame, separators=(",", ":")))
++
++    async def _publish_websocket_event(self, websocket, event: dict) -> None:
++        await self._send_websocket_frame(websocket, ["EVENT", event])
++
++    async def _publish_presence(self, websocket, status: str) -> None:
++        event = self._signed_nostr_event(_WS_PRESENCE_KIND, [], status)
++        await self._publish_websocket_event(websocket, event)
++
++    async def _presence_heartbeat(self, websocket) -> None:
++        try:
++            while True:
++                await asyncio.sleep(_WS_PRESENCE_REFRESH_SECONDS)
++                await self._publish_presence(websocket, "online")
++        except asyncio.CancelledError:
++            raise
++        except Exception:
++            logger.debug("Buzz: presence heartbeat stopped", exc_info=True)
++
++    async def _stop_presence(self, websocket) -> None:
++        task = self._presence_task
++        self._presence_task = None
++        if task and not task.done():
++            task.cancel()
++            try:
++                await task
++            except asyncio.CancelledError:
++                pass
++        try:
++            await self._publish_presence(websocket, "offline")
++        except Exception:
++            logger.debug("Buzz: offline presence publish failed", exc_info=True)
+ 
+     async def _subscribe_websocket(self, websocket) -> Dict[str, Optional[str]]:
+         """Subscribe to every watched conversation plus membership events
+@@ -1160,7 +1223,7 @@ class BuzzAdapter(BasePlatformAdapter):
+                     "since": max(self._membership_since - 1, 0),
+                 },
+             ]
+-            await websocket.send(json.dumps(request, separators=(",", ":")))
++            await self._send_websocket_frame(websocket, request)
+             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
+         return subscriptions
+ 
+@@ -1200,36 +1263,53 @@ class BuzzAdapter(BasePlatformAdapter):
+                     ) as websocket:
+                         await self._authenticate_websocket(websocket)
+                         subscriptions = await self._subscribe_websocket(websocket)
++                        self._ws_socket = websocket
+                         self._ws_active = True
+-                        if self._ws_ready is not None:
+-                            self._ws_ready.set()
+-                        backoff = 1.0
+-                        async for raw in websocket:
+-                            try:
+-                                message = json.loads(raw)
+-                            except (ValueError, TypeError):
+-                                logger.warning("Buzz: ignoring malformed WebSocket frame")
+-                                continue
+-                            if not isinstance(message, list) or not message:
+-                                continue
+-                            if message[0] == "EVENT" and len(message) >= 3:
+-                                subscription_id = str(message[1])
+-                                event = message[2]
+-                                if not isinstance(event, dict):
++                        try:
++                            await self._publish_presence(websocket, "online")
++                            self._presence_task = asyncio.create_task(
++                                self._presence_heartbeat(websocket)
++                            )
++                            if self._ws_ready is not None:
++                                self._ws_ready.set()
++                            backoff = 1.0
++                            async for raw in websocket:
++                                try:
++                                    message = json.loads(raw)
++                                except (ValueError, TypeError):
++                                    logger.warning("Buzz: ignoring malformed WebSocket frame")
+                                     continue
+-                                if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+-                                    await self._handle_membership_event(websocket, subscriptions, event)
++                                if not isinstance(message, list) or not message:
+                                     continue
+-                                channel_id = subscriptions.get(subscription_id)
+-                                state = self._channel_state.get(channel_id or "")
+-                                if channel_id and state is not None:
+-                                    await self._handle_event(channel_id, state, event)
+-                                    self._trim_seen(state)
+-                            elif message[0] == "CLOSED":
+-                                detail = message[-1] if len(message) > 2 else "subscription closed"
+-                                raise ConnectionError(str(detail))
+-                            elif message[0] == "NOTICE":
+-                                logger.warning("Buzz: relay notice: %s", message[-1])
++                                if message[0] == "EVENT" and len(message) >= 3:
++                                    subscription_id = str(message[1])
++                                    event = message[2]
++                                    if not isinstance(event, dict):
++                                        continue
++                                    if subscription_id == _WS_MEMBERSHIP_SUB_ID:
++                                        await self._handle_membership_event(
++                                            websocket, subscriptions, event
++                                        )
++                                        continue
++                                    channel_id = subscriptions.get(subscription_id)
++                                    state = self._channel_state.get(channel_id or "")
++                                    if channel_id and state is not None:
++                                        await self._handle_event(channel_id, state, event)
++                                        self._trim_seen(state)
++                                elif message[0] == "CLOSED":
++                                    detail = (
++                                        message[-1]
++                                        if len(message) > 2
++                                        else "subscription closed"
++                                    )
++                                    raise ConnectionError(str(detail))
++                                elif message[0] == "NOTICE":
++                                    logger.warning("Buzz: relay notice: %s", message[-1])
++                        finally:
++                            await self._stop_presence(websocket)
++                            if self._ws_socket is websocket:
++                                self._ws_socket = None
++                            self._ws_active = False
+                 except asyncio.CancelledError:
+                     raise
+                 except Exception as e:
+@@ -1238,6 +1318,10 @@ class BuzzAdapter(BasePlatformAdapter):
+                     await asyncio.sleep(backoff)
+                     backoff = min(backoff * 2, 30.0)
+         finally:
++            websocket = self._ws_socket
++            if websocket is not None:
++                await self._stop_presence(websocket)
++                self._ws_socket = None
+             self._ws_active = False
+ 
+     # ── Inbound polling ───────────────────────────────────────────────────
+diff --git a/tests/gateway/test_buzz_adapter.py b/tests/gateway/test_buzz_adapter.py
+index d612021bf..7ccb799d9 100644
+--- a/tests/gateway/test_buzz_adapter.py
++++ b/tests/gateway/test_buzz_adapter.py
+@@ -91,7 +91,7 @@ class _ScriptedCli:
+         stdout = payload if isinstance(payload, str) else json.dumps(payload)
+         self.responses.setdefault((group, cmd), []).append((code, stdout, stderr))
+ 
+-    async def __call__(self, args, *, input_text=None):
++    async def __call__(self, args, *, input_text=None, timeout=None):
+         self.calls.append((list(args), input_text))
+         queue = self.responses.get((args[0], args[1]), [])
+         if len(queue) > 1:
+@@ -537,4 +537,3 @@ class TestStandaloneSend:
+         # The private key must never be part of argv
+         assert all("nsec1x" not in str(a) for a in captured["args"])
+ 
+-
+diff --git a/tests/gateway/test_buzz_websocket.py b/tests/gateway/test_buzz_websocket.py
+index d6762fb9a..19d44c946 100644
+--- a/tests/gateway/test_buzz_websocket.py
++++ b/tests/gateway/test_buzz_websocket.py
+@@ -7,6 +7,7 @@ lifecycle as wired into BuzzAdapter.
+ """
+ 
+ import asyncio
++import hashlib
+ import json
+ import time
+ 
+@@ -119,3 +120,165 @@ async def test_websocket_auth_raises_on_rejection():
+         await adapter._authenticate_websocket(RejectingWs())
+ 
+ 
++def _published_events(websocket):
++    return [frame[1] for frame in websocket.sent if frame[0] == "EVENT"]
++
++
++def _assert_event_id_and_signature_shape(event):
++    serialized = json.dumps(
++        [
++            0,
++            event["pubkey"],
++            event["created_at"],
++            event["kind"],
++            event["tags"],
++            event["content"],
++        ],
++        separators=(",", ":"),
++        ensure_ascii=False,
++    ).encode("utf-8")
++    assert event["id"] == hashlib.sha256(serialized).hexdigest()
++    assert len(bytes.fromhex(event["sig"])) == 64
++
++
++@pytest.mark.asyncio
++async def test_typing_event_uses_channel_and_thread_tags():
++    adapter = _make_adapter()
++    websocket = _FakeWebSocket()
++    adapter._ws_socket = websocket
++    adapter._ws_active = True
++
++    await adapter.send_typing(
++        CHANNEL,
++        metadata={"root_event_id": "a" * 64, "parent_event_id": "b" * 64},
++    )
++
++    event = _published_events(websocket)[0]
++    assert event["kind"] == 20002
++    assert event["content"] == ""
++    assert event["tags"] == [
++        ["h", CHANNEL],
++        ["e", "a" * 64, "", "root"],
++        ["e", "b" * 64, "", "reply"],
++    ]
++    _assert_event_id_and_signature_shape(event)
++
++
++@pytest.mark.asyncio
++async def test_typing_is_noop_without_authenticated_websocket():
++    adapter = _make_adapter()
++    websocket = _FakeWebSocket()
++    adapter._ws_socket = websocket
++
++    await adapter.send_typing(CHANNEL)
++
++    assert websocket.sent == []
++
++
++@pytest.mark.asyncio
++async def test_presence_heartbeat_refreshes_online(monkeypatch):
++    adapter = _make_adapter()
++    websocket = _FakeWebSocket()
++    monkeypatch.setattr(_buzz_mod, "_WS_PRESENCE_REFRESH_SECONDS", 0.01)
++
++    task = asyncio.create_task(adapter._presence_heartbeat(websocket))
++    for _ in range(100):
++        if len(_published_events(websocket)) >= 2:
++            break
++        await asyncio.sleep(0.005)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    events = _published_events(websocket)
++    assert len(events) >= 2
++    assert all(event["kind"] == 20001 for event in events)
++    assert all(event["content"] == "online" for event in events)
++
++
++@pytest.mark.asyncio
++async def test_stop_presence_cancels_heartbeat_before_offline():
++    adapter = _make_adapter()
++    websocket = _FakeWebSocket()
++    adapter._presence_task = asyncio.create_task(asyncio.sleep(60))
++
++    await adapter._stop_presence(websocket)
++
++    assert adapter._presence_task is None
++    event = _published_events(websocket)[-1]
++    assert event["kind"] == 20001
++    assert event["content"] == "offline"
++    _assert_event_id_and_signature_shape(event)
++
++
++@pytest.mark.asyncio
++async def test_multiplexed_adapters_publish_on_separate_sockets():
++    first = _make_adapter()
++    second = _make_adapter()
++    first_socket = _FakeWebSocket()
++    second_socket = _FakeWebSocket()
++    first._ws_socket = first_socket
++    second._ws_socket = second_socket
++    first._ws_active = True
++    second._ws_active = True
++
++    await asyncio.gather(first.send_typing(CHANNEL), second.send_typing(CHANNEL))
++
++    assert len(_published_events(first_socket)) == 1
++    assert len(_published_events(second_socket)) == 1
++
++
++@pytest.mark.asyncio
++async def test_websocket_loop_publishes_offline_before_socket_close(monkeypatch):
++    import websockets
++
++    actions = []
++
++    class LifecycleSocket(_FakeWebSocket):
++        async def send(self, raw):
++            frame = json.loads(raw)
++            self.sent.append(frame)
++            if frame[0] == "EVENT":
++                actions.append(frame[1]["content"])
++
++        def __aiter__(self):
++            return self
++
++        async def __anext__(self):
++            await asyncio.Future()
++
++    class Connection:
++        def __init__(self, websocket):
++            self.websocket = websocket
++
++        async def __aenter__(self):
++            return self.websocket
++
++        async def __aexit__(self, exc_type, exc, traceback):
++            actions.append("socket-closed")
++
++    websocket = LifecycleSocket()
++    adapter = _make_adapter()
++
++    async def authenticate(_websocket):
++        return None
++
++    async def subscribe(_websocket):
++        return {}
++
++    adapter._authenticate_websocket = authenticate
++    adapter._subscribe_websocket = subscribe
++    monkeypatch.setattr(websockets, "connect", lambda *args, **kwargs: Connection(websocket))
++
++    task = asyncio.create_task(adapter._websocket_loop())
++    for _ in range(100):
++        if "online" in actions:
++            break
++        await asyncio.sleep(0.005)
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    assert actions == ["online", "offline", "socket-closed"]
++    assert adapter._ws_socket is None
++    assert adapter._presence_task is None
+-- 
+2.53.0
+

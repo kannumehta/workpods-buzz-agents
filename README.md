@@ -89,3 +89,49 @@ To regenerate the tracked series from a clean local Buzz worktree:
 ```
 
 Review changes to all six patches and `UPSTREAM` before committing them.
+
+## Hermes Pods
+
+`pods/` packages six Hermes identities into three containers under the stable
+Compose project `buzz-hermes`. Content, GEO, lifecycle, and performance are
+multiplexed by the internal host; marketing and support desk run separately.
+The host has no Buzz identity. Kanban, the former `workpod`, public profiles,
+all skills, and the unfinished email-management MCP are intentionally absent.
+
+The image owns each `SOUL.md` and `config.yaml`. On every start, the bootstrap
+hash-reconciles only the 22 destinations in `pods/config/manifest.tsv`, creates
+seven bundled-skill opt-out markers, and rejects any remaining `SKILL.md`.
+It never manages `USER.md`, sessions, memories, credentials, or other runtime
+state.
+
+Validate and build without deploying:
+
+```bash
+./pods/scripts/validate
+./pods/scripts/build-image
+```
+
+`build-image` always rebuilds the pinned Buzz CLI first, verifies its
+provenance, and tags Hermes with the full Git revision. Compose has no build
+stanza and refuses to render unless `WORKPODS_BUILD_REVISION` names that exact
+image. This prevents a clean checkout from using absent or stale ignored
+artifacts. Do not use `:local`, install the ACP artifact, or run `docker compose
+up` as part of build validation.
+
+Before a separately approved deployment, export the current image to cold
+storage and run the fail-closed gate:
+
+```bash
+./pods/scripts/export-rollback workpods/hermes-codex:local "$COLD_ARCHIVE_ROOT"
+WORKPODS_ROLLBACK_ARCHIVE_ROOT="$COLD_ARCHIVE_ROOT" ./pods/scripts/predeploy
+```
+
+`predeploy` requires all six identity files to be regular, non-symlink files
+with mode `0600`; verifies the revision image and rollback archive; and renders
+Compose without starting anything. See `pods/DEPLOY.md` for cutover, rollback,
+and session-state recovery procedures.
+
+Secret examples under `pods/env/` map to
+`.runtime/secrets/hermes-pods/`. The four internal identity files are mounted
+read-only at `profiles/<name>/.env` inside the internal state tree. Populate the
+secret files by migrating the current files; never paste key values into Git.

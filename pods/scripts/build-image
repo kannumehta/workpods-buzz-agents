@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  printf 'refusing to label an image from a dirty tracked tree\n' >&2
+  exit 1
+fi
+
+revision=$(git rev-parse HEAD)
+tag="workpods/hermes-codex:$revision"
+
+# shellcheck source=../../buzz-acp/UPSTREAM
+source "$repo_root/buzz-acp/UPSTREAM"
+
+./buzz-acp/scripts/build
+
+python3 - "$repo_root" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+values = {}
+for line in (root / "buzz-acp/UPSTREAM").read_text().splitlines():
+    if line and not line.startswith("#"):
+        key, value = line.split("=", 1)
+        values[key] = value
+provenance = json.loads((root / "buzz-acp/dist/provenance.json").read_text())
+expected = {
+    "upstream_revision": values["UPSTREAM_REV"],
+    "patch_head": values["PATCH_HEAD"],
+    "patched_tree": values["PATCH_TREE"],
+    "rust_image": values["RUST_IMAGE"],
+    "rust_toolchain": values["RUST_TOOLCHAIN"],
+}
+for key, value in expected.items():
+    if provenance.get(key) != value:
+        raise SystemExit(f"stale Buzz provenance: {key}")
+if len(provenance.get("patches", [])) != 6:
+    raise SystemExit("stale Buzz provenance: expected six patches")
+PY
+
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null
+  docker_cmd=(sudo -n docker)
+fi
+
+"${docker_cmd[@]}" build \
+  --build-arg "WORKPODS_BUILD_REVISION=$revision" \
+  --build-arg "BUZZ_PATCH_HEAD=$PATCH_HEAD" \
+  --build-arg "BUZZ_PATCH_TREE=$PATCH_TREE" \
+  --tag "$tag" \
+  --file pods/Dockerfile.hermes-codex \
+  .
+
+actual=$("${docker_cmd[@]}" image inspect "$tag" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+test "$actual" = "$revision"
+printf '%s\n' "$tag"

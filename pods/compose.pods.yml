@@ -1,0 +1,81 @@
+name: buzz-hermes
+
+x-hermes-agent: &hermes-agent
+  image: workpods/hermes-codex:${WORKPODS_BUILD_REVISION:?set to the built revision}
+  command: ["gateway", "run"]
+  environment: &hermes-environment
+    HERMES_HOME: /opt/data
+    HOME: /opt/data/home
+    CODEX_HOME: /opt/data/home/.codex
+    HERMES_GATEWAY_BOOTSTRAP_STATE: running
+    BUZZ_UPLOAD_URL: http://buzz-relay-1:3000/upload
+    BUZZ_UPLOAD_HOST: beta-buzz.workpods.ai
+  restart: unless-stopped
+  stop_grace_period: 30s
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/hermes/.venv/bin/hermes gateway status >/dev/null 2>&1"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 60s
+  networks:
+    - workpods
+
+services:
+  hermes-internal-workpods:
+    <<: *hermes-agent
+    container_name: hermes-internal-workpods
+    env_file:
+      - path: ../../.runtime/secrets/hermes-pods/composio.env
+        required: false
+      - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
+        required: false
+      - path: ../../.runtime/secrets/hermes-pods/pagespeed-mcp.env
+        required: false
+    environment:
+      <<: *hermes-environment
+      WORKPODS_HERMES_CONFIG_SET: internal-workpods
+    volumes:
+      - ../../.runtime/state/hermes-pods/internal-workpods:/opt/data
+      - ../../.runtime/secrets/hermes-pods/content-pod.env:/opt/data/profiles/content-pod/.env:ro
+      - ../../.runtime/secrets/hermes-pods/geo-pod.env:/opt/data/profiles/geo-pod/.env:ro
+      - ../../.runtime/secrets/hermes-pods/lifecycle-pod.env:/opt/data/profiles/lifecycle-pod/.env:ro
+      - ../../.runtime/secrets/hermes-pods/performance-pod.env:/opt/data/profiles/performance-pod/.env:ro
+      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
+
+  hermes-marketing-pod:
+    <<: *hermes-agent
+    container_name: hermes-marketing-pod
+    env_file:
+      - path: ../../.runtime/secrets/hermes-pods/composio.env
+        required: false
+      - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
+        required: false
+      - path: ../../.runtime/secrets/hermes-pods/marketing-pod.env
+        required: false
+    environment:
+      <<: *hermes-environment
+      WORKPODS_HERMES_CONFIG_SET: marketing-pod
+    volumes:
+      - ../../.runtime/state/hermes-pods/marketing-pod:/opt/data
+      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
+
+  hermes-support-desk-pod:
+    <<: *hermes-agent
+    container_name: hermes-support-desk-pod
+    env_file:
+      - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
+        required: false
+      - path: ../../.runtime/secrets/hermes-pods/support-desk-pod.env
+        required: false
+    environment:
+      <<: *hermes-environment
+      WORKPODS_HERMES_CONFIG_SET: support-desk-pod
+    volumes:
+      - ../../.runtime/state/hermes-pods/support-desk-pod:/opt/data
+      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
+
+networks:
+  workpods:
+    external: true
+    name: workpods

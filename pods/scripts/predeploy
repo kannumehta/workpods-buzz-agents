@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$repo_root"
+
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  printf 'refusing predeploy from a dirty tracked tree\n' >&2
+  exit 1
+fi
+
+revision=$(git rev-parse HEAD)
+image="workpods/hermes-codex:$revision"
+umbrella=${WORKPODS_UMBRELLA_ROOT:-}
+if [[ -z "$umbrella" ]]; then
+  candidate=$repo_root
+  while [[ "$candidate" != / ]]; do
+    if [[ -f "$candidate/services.toml" && -d "$candidate/.runtime" ]]; then
+      umbrella=$candidate
+      break
+    fi
+    candidate=$(dirname "$candidate")
+  done
+fi
+if [[ -z "$umbrella" ]]; then
+  printf 'cannot locate WorkPods umbrella; set WORKPODS_UMBRELLA_ROOT\n' >&2
+  exit 1
+fi
+
+secret_root="$umbrella/.runtime/secrets/hermes-pods"
+identities=(
+  content-pod.env
+  geo-pod.env
+  lifecycle-pod.env
+  performance-pod.env
+  marketing-pod.env
+  support-desk-pod.env
+)
+for identity in "${identities[@]}"; do
+  path="$secret_root/$identity"
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    printf 'identity must be a regular non-symlink file: %s\n' "$path" >&2
+    exit 1
+  fi
+  mode=$(stat -c '%a' "$path")
+  if [[ "$mode" != 600 ]]; then
+    printf 'identity must have mode 600: %s (found %s)\n' "$path" "$mode" >&2
+    exit 1
+  fi
+done
+
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null
+  docker_cmd=(sudo -n docker)
+fi
+actual=$("${docker_cmd[@]}" image inspect "$image" \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+test "$actual" = "$revision"
+# shellcheck source=../../buzz-acp/UPSTREAM
+source "$repo_root/buzz-acp/UPSTREAM"
+actual_head=$("${docker_cmd[@]}" image inspect "$image" \
+  --format '{{index .Config.Labels "io.workpods.buzz.patch-head"}}')
+actual_tree=$("${docker_cmd[@]}" image inspect "$image" \
+  --format '{{index .Config.Labels "io.workpods.buzz.patch-tree"}}')
+test "$actual_head" = "$PATCH_HEAD"
+test "$actual_tree" = "$PATCH_TREE"
+
+rollback_root=${WORKPODS_ROLLBACK_ARCHIVE_ROOT:?set to the cold rollback archive directory}
+checksum="$rollback_root/hermes-codex-rollback-bc2171345764.tar.sha256"
+test -f "$checksum"
+(cd "$rollback_root" && sha256sum -c "$(basename "$checksum")")
+"${docker_cmd[@]}" image inspect \
+  workpods/hermes-codex:rollback-bc2171345764 >/dev/null
+
+WORKPODS_BUILD_REVISION="$revision" docker compose \
+  -f pods/compose.pods.yml config --quiet
+printf 'predeploy checks passed for %s\n' "$image"

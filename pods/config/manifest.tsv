@@ -1,0 +1,23 @@
+# config-set	kind	mode	source	destination
+internal-workpods	file	0644	internal-workpods/SOUL.md	SOUL.md
+internal-workpods	file	0644	internal-workpods/config.yaml	config.yaml
+internal-workpods	marker	0644	-	.no-bundled-skills
+internal-workpods	file	0644	internal-workpods/profile-configs/internal-buzz-pod.yaml	profile-configs/internal-buzz-pod.yaml
+internal-workpods	file	0644	internal-workpods/profiles/content-pod/SOUL.md	profiles/content-pod/SOUL.md
+internal-workpods	symlink	-	../../profile-configs/internal-buzz-pod.yaml	profiles/content-pod/config.yaml
+internal-workpods	marker	0644	-	profiles/content-pod/.no-bundled-skills
+internal-workpods	file	0644	internal-workpods/profiles/geo-pod/SOUL.md	profiles/geo-pod/SOUL.md
+internal-workpods	symlink	-	../../profile-configs/internal-buzz-pod.yaml	profiles/geo-pod/config.yaml
+internal-workpods	marker	0644	-	profiles/geo-pod/.no-bundled-skills
+internal-workpods	file	0644	internal-workpods/profiles/lifecycle-pod/SOUL.md	profiles/lifecycle-pod/SOUL.md
+internal-workpods	symlink	-	../../profile-configs/internal-buzz-pod.yaml	profiles/lifecycle-pod/config.yaml
+internal-workpods	marker	0644	-	profiles/lifecycle-pod/.no-bundled-skills
+internal-workpods	file	0644	internal-workpods/profiles/performance-pod/SOUL.md	profiles/performance-pod/SOUL.md
+internal-workpods	symlink	-	../../profile-configs/internal-buzz-pod.yaml	profiles/performance-pod/config.yaml
+internal-workpods	marker	0644	-	profiles/performance-pod/.no-bundled-skills
+marketing-pod	file	0644	marketing-pod/SOUL.md	SOUL.md
+marketing-pod	file	0644	marketing-pod/config.yaml	config.yaml
+marketing-pod	marker	0644	-	.no-bundled-skills
+support-desk-pod	file	0644	support-desk-pod/SOUL.md	SOUL.md
+support-desk-pod	file	0644	support-desk-pod/config.yaml	config.yaml
+support-desk-pod	marker	0644	-	.no-bundled-skills
