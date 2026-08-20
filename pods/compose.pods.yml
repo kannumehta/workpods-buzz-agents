@@ -41,7 +41,6 @@ services:
       - ../../.runtime/secrets/hermes-pods/geo-pod.env:/opt/data/profiles/geo-pod/.env:ro
       - ../../.runtime/secrets/hermes-pods/lifecycle-pod.env:/opt/data/profiles/lifecycle-pod/.env:ro
       - ../../.runtime/secrets/hermes-pods/performance-pod.env:/opt/data/profiles/performance-pod/.env:ro
-      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
 
   hermes-marketing-pod:
     <<: *hermes-agent
@@ -58,7 +57,6 @@ services:
       WORKPODS_HERMES_CONFIG_SET: marketing-pod
     volumes:
       - ../../.runtime/state/hermes-pods/marketing-pod:/opt/data
-      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
 
   hermes-support-desk-pod:
     <<: *hermes-agent
@@ -73,7 +71,6 @@ services:
       WORKPODS_HERMES_CONFIG_SET: support-desk-pod
     volumes:
       - ../../.runtime/state/hermes-pods/support-desk-pod:/opt/data
-      - /home/ubuntu/.codex:/opt/data/home/.codex:ro
 
 networks:
   workpods:
