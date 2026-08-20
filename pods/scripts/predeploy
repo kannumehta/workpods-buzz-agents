@@ -47,6 +47,11 @@ for identity in "${identities[@]}"; do
     printf 'identity must have mode 600: %s (found %s)\n' "$path" "$mode" >&2
     exit 1
   fi
+  owner=$(stat -c '%u:%g' "$path")
+  if [[ "$owner" != 10000:10000 ]]; then
+    printf 'identity must be owned by Hermes uid/gid 10000:10000: %s (found %s)\n' "$path" "$owner" >&2
+    exit 1
+  fi
 done
 
 docker_cmd=(docker)
