@@ -51,3 +51,16 @@ transport only for these coding agents.
 The harness publishes final assistant text as the signed Buzz reply. Do not
 configure agents to call `buzz messages send` for the ordinary response to the
 triggering message.
+
+## Pinned Buzz Build
+
+The WorkPods `buzz-acp` and Hermes `buzz` CLI are built from the pinned upstream
+revision and ordered patch series under `buzz-acp/`. Run
+`buzz-acp/scripts/build` to produce ignored artifacts in `buzz-acp/dist/`.
+The build must never install or replace `.runtime/bin/buzz-acp`; rolling out a
+new coding-agent binary is a separate, explicitly approved operation.
+
+Use `buzz-acp/scripts/refresh-patches SOURCE_WORKTREE` only with a clean local
+Buzz worktree whose six commits descend from the revision in `UPSTREAM`. Use
+`rebase-upstream` to rehearse an upstream update without modifying the tracked
+series.

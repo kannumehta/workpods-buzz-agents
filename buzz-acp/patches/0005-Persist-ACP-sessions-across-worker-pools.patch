@@ -1,0 +1,991 @@
+From cc775b7d610ffbe65baec07af958613201c770c2 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Wed, 19 Aug 2026 06:47:53 +0000
+Subject: [PATCH 5/6] Persist ACP sessions across worker pools
+
+---
+ crates/buzz-acp/src/acp.rs  |  70 ++++-
+ crates/buzz-acp/src/lib.rs  |  77 ++---
+ crates/buzz-acp/src/pool.rs | 552 ++++++++++++++++++++++++++++++++----
+ 3 files changed, 612 insertions(+), 87 deletions(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index 927df8225..eecce5f9e 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -1847,7 +1847,7 @@ impl AcpClient {
+         match update_type {
+             "agent_message_chunk" => {
+                 if let Some(text) = update["content"]["text"].as_str() {
+-                    self.last_assistant_text.push_str(text);
++                    append_assistant_text_chunk(&mut self.last_assistant_text, text);
+                     tracing::info!(target: "acp::stream", "{text}");
+                 }
+                 false
+@@ -2124,6 +2124,47 @@ impl AcpClient {
+     }
+ }
+ 
++fn append_assistant_text_chunk(buffer: &mut String, chunk: &str) {
++    if chunk.is_empty() {
++        return;
++    }
++    if let Some(separator) = assistant_chunk_separator(buffer, chunk) {
++        buffer.push_str(separator);
++    }
++    buffer.push_str(chunk);
++}
++
++fn assistant_chunk_separator(buffer: &str, chunk: &str) -> Option<&'static str> {
++    let previous = buffer.chars().next_back()?;
++    let next = chunk.chars().next()?;
++
++    if previous.is_whitespace() || next.is_whitespace() {
++        return None;
++    }
++
++    if next == '@' {
++        return if is_sentence_boundary(previous) {
++            Some("\n\n")
++        } else {
++            Some(" ")
++        };
++    }
++
++    if is_sentence_boundary(previous) && starts_sentence_like(next) {
++        return Some(" ");
++    }
++
++    None
++}
++
++fn is_sentence_boundary(ch: char) -> bool {
++    matches!(ch, '.' | '!' | '?' | ':' | ';')
++}
++
++fn starts_sentence_like(ch: char) -> bool {
++    ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '`' || ch == '"' || ch == '\''
++}
++
+ /// Build `session/prompt` params from one or more text content blocks.
+ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+     let blocks: Vec<serde_json::Value> = prompt_blocks
+@@ -2468,6 +2509,33 @@ mod tests {
+         assert_eq!(StopReason::from_str("endturn"), None); // no camelCase — still unknown
+     }
+ 
++    #[test]
++    fn assistant_chunk_accumulator_preserves_word_splits() {
++        let mut text = String::new();
++        append_assistant_text_chunk(&mut text, "clean");
++        append_assistant_text_chunk(&mut text, "ly");
++        assert_eq!(text, "cleanly");
++    }
++
++    #[test]
++    fn assistant_chunk_accumulator_separates_hidden_mentions() {
++        let mut text = String::new();
++        append_assistant_text_chunk(&mut text, "operator-controlled rollout.");
++        append_assistant_text_chunk(&mut text, "@claude addressed the fixes.");
++        assert_eq!(
++            text,
++            "operator-controlled rollout.\n\n@claude addressed the fixes."
++        );
++    }
++
++    #[test]
++    fn assistant_chunk_accumulator_separates_sentence_boundaries() {
++        let mut text = String::new();
++        append_assistant_text_chunk(&mut text, "Done.");
++        append_assistant_text_chunk(&mut text, "Next step is validation.");
++        assert_eq!(text, "Done. Next step is validation.");
++    }
++
+     #[test]
+     fn stop_reason_is_case_insensitive() {
+         // Agents may send uppercase or mixed-case variants — all should parse correctly.
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index 213ba0c35..aa9cc6b0e 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -1460,6 +1460,22 @@ fn handle_switch_model_control(
+     }
+ }
+ 
++fn remove_persisted_channel_session(
++    ctx: &PromptContext,
++    channel_id: Uuid,
++    reason: &'static str,
++) {
++    if let Some(store) = &ctx.session_store {
++        if let Err(error) = store.remove_channel(channel_id) {
++            tracing::warn!(
++                target: "pool::session_store",
++                %channel_id,
++                "failed to remove persisted session during {reason}: {error}"
++            );
++        }
++    }
++}
++
+ /// Maximum crashes in a 60-second window before a slot's circuit opens.
+ const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
+ /// Window for circuit-breaker crash counting.
+@@ -2006,18 +2022,10 @@ async fn tokio_main() -> Result<()> {
+ 
+     tracing::info!("buzz-acp starting: {}", config.summary());
+ 
+-    let session_store = match config.session_state_file.clone() {
+-        Some(path) if config.agents == 1 => Some(Arc::new(SessionStateStore::new(path))),
+-        Some(path) => {
+-            tracing::warn!(
+-                path = %path.display(),
+-                agents = config.agents,
+-                "session state file is ignored when BUZZ_ACP_AGENTS is greater than 1"
+-            );
+-            None
+-        }
+-        None => None,
+-    };
++    let session_store = config
++        .session_state_file
++        .clone()
++        .map(|path| Arc::new(SessionStateStore::new(path)));
+     let persisted_sessions = session_store
+         .as_ref()
+         .map(|store| store.load())
+@@ -2295,11 +2303,12 @@ async fn tokio_main() -> Result<()> {
+         relay_url: config.relay_url.clone(),
+     });
+ 
+-    if session_store.is_some() && config.agents == 1 {
++    if session_store.is_some() {
+         pool.seed_session_state(&persisted_sessions);
+         tracing::info!(
+             target: "pool::session_store",
+             channels = persisted_sessions.state.sessions.len(),
++            agents = config.agents,
+             "loaded persisted session state"
+         );
+     }
+@@ -2801,6 +2810,7 @@ async fn tokio_main() -> Result<()> {
+                                     } else {
+                                         0
+                                     };
++                                    remove_persisted_channel_session(&ctx, ch, "channel removal");
+                                     // Track removed channels so checked-out agents get
+                                     // their sessions stripped when they return to the pool.
+                                     removed_channels.insert(ch);
+@@ -2928,6 +2938,11 @@ async fn tokio_main() -> Result<()> {
+                                             );
+                                         } else {
+                                             let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
++                                            remove_persisted_channel_session(
++                                                &ctx,
++                                                buzz_event.channel_id,
++                                                "rotate",
++                                            );
+                                             tracing::info!(
+                                                 channel_id = %buzz_event.channel_id,
+                                                 invalidated,
+@@ -3029,19 +3044,15 @@ async fn tokio_main() -> Result<()> {
+                                                                 .or_insert_with(SessionOverride::default)
+                                                                 .model = Some(model.clone());
+                                                         }
+-                                                        let fired = signal_in_flight_task(
+-                                                            &mut pool,
+-                                                            buzz_event.channel_id,
+-                                                            ControlSignal::ReconfigureSession,
+-                                                        );
+-                                                        if !fired {
+-                                                            pool.invalidate_channel_sessions(
++                                                        if let Some(store) = &ctx.session_store {
++                                                            pool.persist_idle_channel_session(
++                                                                store,
+                                                                 buzz_event.channel_id,
++                                                                &ctx.session_overrides,
+                                                             );
+-                                                            pool.persist_idle_session_state(&ctx);
+                                                         }
+                                                         format!(
+-                                                            "Session model set to `{model}` for this channel."
++                                                            "Session model set to `{model}` for this channel. It will apply on the next turn without changing the session."
+                                                         )
+                                                     }
+                                                 }
+@@ -3055,19 +3066,15 @@ async fn tokio_main() -> Result<()> {
+                                                         .or_insert_with(SessionOverride::default)
+                                                         .permission_mode = Some(mode);
+                                                 }
+-                                                let fired = signal_in_flight_task(
+-                                                    &mut pool,
+-                                                    buzz_event.channel_id,
+-                                                    ControlSignal::ReconfigureSession,
+-                                                );
+-                                                if !fired {
+-                                                    pool.invalidate_channel_sessions(
++                                                if let Some(store) = &ctx.session_store {
++                                                    pool.persist_idle_channel_session(
++                                                        store,
+                                                         buzz_event.channel_id,
++                                                        &ctx.session_overrides,
+                                                     );
+-                                                    pool.persist_idle_session_state(&ctx);
+                                                 }
+                                                 format!(
+-                                                    "Session mode set to `{mode}` for this channel."
++                                                    "Session mode set to `{mode}` for this channel. It will apply on the next turn without changing the session."
+                                                 )
+                                             }
+                                             Ok(SessionControlCommand::ShowSession) => {
+@@ -3108,7 +3115,11 @@ async fn tokio_main() -> Result<()> {
+                                                     pool.invalidate_channel_sessions(
+                                                         buzz_event.channel_id,
+                                                     );
+-                                                    pool.persist_idle_session_state(&ctx);
++                                                    remove_persisted_channel_session(
++                                                        &ctx,
++                                                        buzz_event.channel_id,
++                                                        "reset",
++                                                    );
+                                                 }
+                                                 "Session overrides cleared for this channel."
+                                                     .to_string()
+@@ -3604,7 +3615,7 @@ async fn tokio_main() -> Result<()> {
+                         pool = pool_lifecycle
+                             .take_ready()
+                             .expect("successful wake stores a ready pool");
+-                        if session_store.is_some() && config.agents == 1 {
++                        if session_store.is_some() {
+                             pool.seed_session_state(&persisted_sessions);
+                         }
+                         pool_ready = true;
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 18d498705..9d7c44c50 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -89,6 +89,8 @@ pub struct AgentModelCapabilities {
+     pub config_options_raw: Vec<serde_json::Value>,
+     /// Unstable: SessionModelState from session/new.
+     pub available_models_raw: Option<serde_json::Value>,
++    /// Permission modes advertised by session/new.
++    pub modes_raw: Option<serde_json::Value>,
+ }
+ 
+ /// Successful deliveries associated with one live channel session.
+@@ -330,34 +332,53 @@ impl SessionStateStore {
+         snapshot
+     }
+ 
+-    pub fn save(
+-        &self,
+-        state: &SessionState,
+-        overrides: &HashMap<Uuid, SessionOverride>,
+-    ) -> std::io::Result<()> {
++    fn load_file(&self) -> PersistedSessionFile {
++        let Ok(bytes) = std::fs::read(&*self.path) else {
++            return PersistedSessionFile::default();
++        };
++        serde_json::from_slice::<PersistedSessionFile>(&bytes).unwrap_or_default()
++    }
++
++    fn write_file(&self, file: &PersistedSessionFile) -> std::io::Result<()> {
+         if let Some(parent) = self.path.parent() {
+             std::fs::create_dir_all(parent)?;
+         }
+-        let mut file = PersistedSessionFile::default();
+-        for (channel_id, session_id) in &state.sessions {
+-            let session_override = overrides.get(channel_id);
+-            file.channels.insert(
+-                channel_id.to_string(),
+-                PersistedChannelSession {
+-                    session_id: session_id.clone(),
+-                    turn_count: state.turn_counts.get(channel_id).copied().unwrap_or(0),
+-                    model: session_override.and_then(|o| o.model.clone()),
+-                    permission_mode: session_override
+-                        .and_then(|o| o.permission_mode)
+-                        .map(|mode| mode.as_public_str().to_string()),
+-                },
+-            );
+-        }
+         let json = serde_json::to_vec_pretty(&file)?;
+         let tmp_path = self.path.with_extension("json.tmp");
+         std::fs::write(&tmp_path, json)?;
+         std::fs::rename(tmp_path, &*self.path)
+     }
++
++    pub fn save_channel(
++        &self,
++        channel_id: Uuid,
++        state: &SessionState,
++        overrides: &HashMap<Uuid, SessionOverride>,
++    ) -> std::io::Result<()> {
++        let Some(session_id) = state.sessions.get(&channel_id) else {
++            return self.remove_channel(channel_id);
++        };
++        let mut file = self.load_file();
++        let session_override = overrides.get(&channel_id);
++        file.channels.insert(
++            channel_id.to_string(),
++            PersistedChannelSession {
++                session_id: session_id.clone(),
++                turn_count: state.turn_counts.get(&channel_id).copied().unwrap_or(0),
++                model: session_override.and_then(|o| o.model.clone()),
++                permission_mode: session_override
++                    .and_then(|o| o.permission_mode)
++                    .map(|mode| mode.as_public_str().to_string()),
++            },
++        );
++        self.write_file(&file)
++    }
++
++    pub fn remove_channel(&self, channel_id: Uuid) -> std::io::Result<()> {
++        let mut file = self.load_file();
++        file.channels.remove(&channel_id.to_string());
++        self.write_file(&file)
++    }
+ }
+ 
+ fn parse_persisted_permission_mode(raw: &str) -> Option<PermissionMode> {
+@@ -376,16 +397,17 @@ fn parse_persisted_permission_mode(raw: &str) -> Option<PermissionMode> {
+     }
+ }
+ 
+-fn persist_session_state(
++fn persist_channel_session_state(
+     store: &SessionStateStore,
+     state: &SessionState,
++    channel_id: Uuid,
+     overrides: &SessionOverrides,
+ ) {
+     let override_snapshot = overrides
+         .lock()
+         .map(|overrides| overrides.clone())
+         .unwrap_or_default();
+-    if let Err(error) = store.save(state, &override_snapshot) {
++    if let Err(error) = store.save_channel(channel_id, state, &override_snapshot) {
+         tracing::warn!(
+             target: "pool::session_store",
+             path = %store.path().display(),
+@@ -394,6 +416,17 @@ fn persist_session_state(
+     }
+ }
+ 
++fn persist_prompt_source_session_state(
++    store: &SessionStateStore,
++    state: &SessionState,
++    source: &PromptSource,
++    overrides: &SessionOverrides,
++) {
++    if let PromptSource::Channel(channel_id) = source {
++        persist_channel_session_state(store, state, *channel_id, overrides);
++    }
++}
++
+ /// Package name reported by `claude-agent-acp` in its `initialize` response.
+ /// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
+ /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
+@@ -525,8 +558,8 @@ pub enum ControlSignal {
+     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
+     /// — never persisted, gone on restart/respawn.
+     SwitchModel(String),
+-    /// Recreate the channel session so slash-command model/mode overrides
+-    /// stored in [`PromptContext::session_overrides`] take effect.
++    /// Recreate the channel session so destructive control commands such as
++    /// `/reset-session` take effect.
+     ReconfigureSession,
+ }
+ 
+@@ -1025,6 +1058,24 @@ impl AgentPool {
+         count
+     }
+ 
++    pub fn persist_idle_channel_session(
++        &self,
++        store: &SessionStateStore,
++        channel_id: Uuid,
++        overrides: &SessionOverrides,
++    ) -> bool {
++        let Some(agent) = self
++            .agents
++            .iter()
++            .flatten()
++            .find(|agent| agent.state.sessions.contains_key(&channel_id))
++        else {
++            return false;
++        };
++        persist_channel_session_state(store, &agent.state, channel_id, overrides);
++        true
++    }
++
+     /// Seed idle agents from durable session state. Only intended for
+     /// single-agent service instances; callers enforce that before invoking it.
+     pub fn seed_session_state(&mut self, snapshot: &PersistedSessionSnapshot) {
+@@ -1033,18 +1084,6 @@ impl AgentPool {
+         }
+     }
+ 
+-    /// Persist the first idle agent's session state. The deployed service runs
+-    /// one ACP child process per systemd instance, so one map is authoritative.
+-    pub fn persist_idle_session_state(&self, ctx: &PromptContext) {
+-        let Some(store) = &ctx.session_store else {
+-            return;
+-        };
+-        let Some(agent) = self.agents.iter().flatten().next() else {
+-            return;
+-        };
+-        persist_session_state(store, &agent.state, &ctx.session_overrides);
+-    }
+-
+     /// Check an idle channel session's cached model catalog, when available.
+     ///
+     /// `None` means there is no idle session/catalog yet, so callers should
+@@ -1293,6 +1332,7 @@ async fn create_session_and_apply_model(
+         agent.model_capabilities = Some(AgentModelCapabilities {
+             config_options_raw: extract_model_config_options(&resp.raw),
+             available_models_raw: extract_model_state(&resp.raw),
++            modes_raw: resp.raw.get("modes").cloned(),
+         });
+     }
+ 
+@@ -1431,6 +1471,7 @@ async fn restore_session_and_apply_config(
+         agent.model_capabilities = Some(AgentModelCapabilities {
+             config_options_raw: extract_model_config_options(&resp),
+             available_models_raw: extract_model_state(&resp),
++            modes_raw: resp.get("modes").cloned(),
+         });
+     }
+ 
+@@ -1576,16 +1617,9 @@ async fn apply_model_switch(
+     Ok(())
+ }
+ 
+-/// Set the session permission mode via `session/set_config_option`.
+-///
+-/// Non-fatal for most errors: logs and proceeds. The agent falls back
+-/// to its default permission mode (`"default"`), which still works via
+-/// Check if the agent's `session/new` response advertises a given mode ID
+-/// in `result.modes.availableModes[].id`. Returns `false` if the modes
+-/// field is absent or the mode isn't listed.
+-fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
+-    session_new_result
+-        .get("modes")
++/// Check whether a stored session mode catalog advertises a given wire mode.
++fn mode_catalog_supports(modes: Option<&serde_json::Value>, mode_wire: &str) -> bool {
++    modes
+         .and_then(|m| m.get("availableModes"))
+         .and_then(|a| a.as_array())
+         .map(|modes| {
+@@ -1599,11 +1633,18 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str)
+ fn select_supported_permission_mode(
+     session_new_result: &serde_json::Value,
+     mode: PermissionMode,
++) -> Option<&'static str> {
++    select_supported_permission_mode_from_modes(session_new_result.get("modes"), mode)
++}
++
++fn select_supported_permission_mode_from_modes(
++    modes: Option<&serde_json::Value>,
++    mode: PermissionMode,
+ ) -> Option<&'static str> {
+     mode.preferred_wire_modes()
+         .iter()
+         .copied()
+-        .find(|wire| agent_supports_mode(session_new_result, wire))
++        .find(|wire| mode_catalog_supports(modes, wire))
+ }
+ 
+ fn effective_permission_mode(ctx: &PromptContext, channel_id: Option<Uuid>) -> PermissionMode {
+@@ -1676,6 +1717,73 @@ async fn apply_permission_mode(
+     Ok(())
+ }
+ 
++async fn apply_live_channel_session_config(
++    agent: &mut OwnedAgent,
++    ctx: &PromptContext,
++    channel_id: Uuid,
++    session_id: &str,
++) -> Result<(), AcpError> {
++    let session_override = ctx
++        .session_overrides
++        .lock()
++        .ok()
++        .and_then(|overrides| overrides.get(&channel_id).cloned());
++
++    let Some(session_override) = session_override else {
++        return Ok(());
++    };
++
++    if let Some(desired) = session_override.model.as_deref() {
++        let Some(caps) = agent.model_capabilities.as_ref() else {
++            tracing::warn!(
++                target: "pool::model",
++                "cannot apply live model {desired} on session {session_id}: model catalog is unavailable"
++            );
++            return Ok(());
++        };
++        let mut catalog = serde_json::json!({
++            "configOptions": caps.config_options_raw.clone(),
++        });
++        if let Some(models) = caps.available_models_raw.as_ref() {
++            catalog["models"] = models.clone();
++        }
++        match resolve_model_switch_method(&catalog, desired) {
++            Some(method) => {
++                apply_model_switch(&mut agent.acp, session_id, desired, &method).await?;
++            }
++            None => {
++                tracing::warn!(
++                    target: "pool::model",
++                    "desired model {desired} not found for live session {session_id} — keeping current model"
++                );
++                agent.acp.observe(
++                    "control_result",
++                    serde_json::json!({
++                        "type": "switch_model",
++                        "status": "unsupported_model",
++                        "modelId": desired,
++                    }),
++                );
++            }
++        }
++    }
++
++    if let Some(mode) = session_override.permission_mode {
++        if let Some(wire_mode) = agent.model_capabilities.as_ref().and_then(|caps| {
++            select_supported_permission_mode_from_modes(caps.modes_raw.as_ref(), mode)
++        }) {
++            apply_permission_mode(&mut agent.acp, session_id, wire_mode).await?;
++        } else {
++            tracing::info!(
++                target: "pool::permission",
++                "live session mode {mode} has no advertised ACP mode for session {session_id} — using adapter/process defaults"
++            );
++        }
++    }
++
++    Ok(())
++}
++
+ /// Prepend a legacy agent's standing context to a user-message body.
+ ///
+ /// Legacy agents (`protocol_version < 2`) don't receive standing context via
+@@ -2100,9 +2208,10 @@ pub async fn run_prompt_task(
+                             );
+                             agent.state.invalidate_channel(cid);
+                             if let Some(store) = &ctx.session_store {
+-                                persist_session_state(
++                                persist_channel_session_state(
+                                     store,
+                                     &agent.state,
++                                    *cid,
+                                     &ctx.session_overrides,
+                                 );
+                             }
+@@ -2136,9 +2245,10 @@ pub async fn run_prompt_task(
+                                         agent.state.canvas_sections.insert(pending_cid, section);
+                                     }
+                                     if let Some(store) = &ctx.session_store {
+-                                        persist_session_state(
++                                        persist_channel_session_state(
+                                             store,
+                                             &agent.state,
++                                            *cid,
+                                             &ctx.session_overrides,
+                                         );
+                                     }
+@@ -2211,7 +2321,12 @@ pub async fn run_prompt_task(
+                             agent.state.canvas_sections.insert(pending_cid, section);
+                         }
+                         if let Some(store) = &ctx.session_store {
+-                            persist_session_state(store, &agent.state, &ctx.session_overrides);
++                            persist_channel_session_state(
++                                store,
++                                &agent.state,
++                                *cid,
++                                &ctx.session_overrides,
++                            );
+                         }
+                         (sid, true)
+                     }
+@@ -2315,6 +2430,36 @@ pub async fn run_prompt_task(
+             "isNewSession": is_new_session,
+         }),
+     );
++    if !is_new_session {
++        if let PromptSource::Channel(cid) = &source {
++            match apply_live_channel_session_config(&mut agent, &ctx, *cid, &session_id).await {
++                Ok(()) => {}
++                Err(AcpError::AgentExited) => {
++                    agent.state.invalidate_all();
++                    send_prompt_result(
++                        &result_tx,
++                        &turn_id,
++                        agent,
++                        source,
++                        PromptOutcome::AgentExited,
++                        requeue_batch_if_queue(&ctx, batch),
++                    );
++                    return;
++                }
++                Err(e) => {
++                    send_prompt_result(
++                        &result_tx,
++                        &turn_id,
++                        agent,
++                        source,
++                        PromptOutcome::Error(e),
++                        requeue_batch_if_queue(&ctx, batch),
++                    );
++                    return;
++                }
++            }
++        }
++    }
+ 
+     // Standing context is fixed for the life of a session. Agents with
+     // systemPrompt support already hold it from session/new; legacy agents
+@@ -2726,9 +2871,10 @@ pub async fn run_prompt_task(
+                                 log_stop_reason(&source, &stop_reason);
+                                 agent.state.invalidate(&source);
+                                 if let Some(store) = &ctx.session_store {
+-                                    persist_session_state(
++                                    persist_prompt_source_session_state(
+                                         store,
+                                         &agent.state,
++                                        &source,
+                                         &ctx.session_overrides,
+                                     );
+                                 }
+@@ -2837,7 +2983,12 @@ pub async fn run_prompt_task(
+                             &control_signal,
+                         );
+                         if let Some(store) = &ctx.session_store {
+-                            persist_session_state(store, &agent.state, &ctx.session_overrides);
++                            persist_prompt_source_session_state(
++                                store,
++                                &agent.state,
++                                &source,
++                                &ctx.session_overrides,
++                            );
+                         }
+                         let usage = agent.acp.take_turn_usage();
+                         publish_agent_turn_metric(
+@@ -2911,7 +3062,12 @@ pub async fn run_prompt_task(
+                 agent.state.invalidate(&source);
+             }
+             if let Some(store) = &ctx.session_store {
+-                persist_session_state(store, &agent.state, &ctx.session_overrides);
++                persist_prompt_source_session_state(
++                    store,
++                    &agent.state,
++                    &source,
++                    &ctx.session_overrides,
++                );
+             }
+ 
+             let core_stop = acp_stop_to_core(&stop_reason);
+@@ -5185,6 +5341,137 @@ mod tests {
+         }
+     }
+ 
++    fn temp_session_store() -> (SessionStateStore, PathBuf) {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        (SessionStateStore::new(path.clone()), path)
++    }
++
++    #[test]
++    fn session_store_save_channel_preserves_other_worker_channels() {
++        let (store, path) = temp_session_store();
++        let channel_a = Uuid::new_v4();
++        let channel_b = Uuid::new_v4();
++
++        let mut state_a = SessionState::default();
++        state_a.sessions.insert(channel_a, "session-a".into());
++        state_a.turn_counts.insert(channel_a, 7);
++        let mut overrides_a = HashMap::new();
++        overrides_a.insert(
++            channel_a,
++            SessionOverride {
++                model: Some("model-a".into()),
++                permission_mode: Some(PermissionMode::Auto),
++            },
++        );
++        store
++            .save_channel(channel_a, &state_a, &overrides_a)
++            .expect("save channel a");
++
++        let mut state_b = SessionState::default();
++        state_b.sessions.insert(channel_b, "session-b".into());
++        let overrides_b = HashMap::new();
++        store
++            .save_channel(channel_b, &state_b, &overrides_b)
++            .expect("save channel b");
++
++        let snapshot = store.load();
++        assert_eq!(snapshot.state.sessions.get(&channel_a).unwrap(), "session-a");
++        assert_eq!(snapshot.state.sessions.get(&channel_b).unwrap(), "session-b");
++        assert_eq!(snapshot.state.turn_counts.get(&channel_a), Some(&7));
++        assert_eq!(
++            snapshot.overrides.get(&channel_a).unwrap().permission_mode,
++            Some(PermissionMode::Auto)
++        );
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_save_channel_updates_override_without_changing_session() {
++        let (store, path) = temp_session_store();
++        let channel = Uuid::new_v4();
++
++        let mut state = SessionState::default();
++        state.sessions.insert(channel, "stable-session".into());
++        let mut overrides = HashMap::new();
++        store
++            .save_channel(channel, &state, &overrides)
++            .expect("save initial channel");
++
++        overrides.insert(
++            channel,
++            SessionOverride {
++                model: Some("sonnet".into()),
++                permission_mode: Some(PermissionMode::Auto),
++            },
++        );
++        store
++            .save_channel(channel, &state, &overrides)
++            .expect("save updated override");
++
++        let snapshot = store.load();
++        assert_eq!(snapshot.state.sessions.get(&channel).unwrap(), "stable-session");
++        assert_eq!(
++            snapshot.overrides.get(&channel).unwrap().model.as_deref(),
++            Some("sonnet")
++        );
++        assert_eq!(
++            snapshot.overrides.get(&channel).unwrap().permission_mode,
++            Some(PermissionMode::Auto)
++        );
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn stored_mode_catalog_selects_live_permission_mode() {
++        let modes = json!({
++            "availableModes": [
++                {"id": "plan"},
++                {"id": "acceptEdits"},
++                {"id": "bypassPermissions"}
++            ]
++        });
++
++        assert_eq!(
++            select_supported_permission_mode_from_modes(Some(&modes), PermissionMode::Auto),
++            Some("bypassPermissions")
++        );
++        assert_eq!(
++            select_supported_permission_mode_from_modes(Some(&modes), PermissionMode::Edit),
++            Some("acceptEdits")
++        );
++        assert_eq!(
++            select_supported_permission_mode_from_modes(Some(&modes), PermissionMode::Plan),
++            Some("plan")
++        );
++    }
++
++    #[test]
++    fn session_store_remove_channel_keeps_other_worker_channels() {
++        let (store, path) = temp_session_store();
++        let channel_a = Uuid::new_v4();
++        let channel_b = Uuid::new_v4();
++
++        for (channel, session) in [(channel_a, "session-a"), (channel_b, "session-b")] {
++            let mut state = SessionState::default();
++            state.sessions.insert(channel, session.into());
++            store
++                .save_channel(channel, &state, &HashMap::new())
++                .expect("save channel");
++        }
++
++        store
++            .remove_channel(channel_a)
++            .expect("remove one channel");
++
++        let snapshot = store.load();
++        assert!(!snapshot.state.sessions.contains_key(&channel_a));
++        assert_eq!(snapshot.state.sessions.get(&channel_b).unwrap(), "session-b");
++        let _ = std::fs::remove_file(path);
++    }
++
+     #[test]
+     fn public_session_forwards_channel_origin_to_mcp() {
+         let channel_id = Uuid::new_v4();
+@@ -6612,6 +6899,165 @@ done"#
+         );
+     }
+ 
++    #[tokio::test]
++    async fn successful_channel_prompt_posts_streamed_assistant_text() {
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
++            .await
++            .expect("bind relay capture server");
++        let base_url = format!("http://{}", listener.local_addr().unwrap());
++        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
++        let server = tokio::spawn(async move {
++            while let Ok((mut socket, _)) = listener.accept().await {
++                let mut bytes = Vec::new();
++                let mut buf = [0_u8; 4096];
++                let mut header_end = None;
++                let mut content_len = None;
++                loop {
++                    let Ok(n) = socket.read(&mut buf).await else {
++                        break;
++                    };
++                    if n == 0 {
++                        break;
++                    }
++                    bytes.extend_from_slice(&buf[..n]);
++                    if header_end.is_none() {
++                        if let Some(pos) =
++                            bytes.windows(4).position(|window| window == b"\r\n\r\n")
++                        {
++                            header_end = Some(pos + 4);
++                            let headers = String::from_utf8_lossy(&bytes[..pos]);
++                            content_len = headers.lines().find_map(|line| {
++                                let (name, value) = line.split_once(':')?;
++                                if name.eq_ignore_ascii_case("content-length") {
++                                    value.trim().parse::<usize>().ok()
++                                } else {
++                                    None
++                                }
++                            });
++                        }
++                    }
++                    if let (Some(start), Some(len)) = (header_end, content_len) {
++                        if bytes.len() >= start + len {
++                            break;
++                        }
++                    }
++                }
++
++                let header_end = header_end.unwrap_or(bytes.len());
++                let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
++                let body_len = content_len.unwrap_or(0);
++                let body_end = (header_end + body_len).min(bytes.len());
++                let body = &bytes[header_end..body_end];
++                if headers.starts_with("POST /events ") {
++                    if let Ok(event) = serde_json::from_slice::<serde_json::Value>(body) {
++                        let _ = event_tx.send(event);
++                    }
++                }
++                let response_body = if headers.starts_with("POST /query ") {
++                    "[]"
++                } else {
++                    "{}"
++                };
++                let response = format!(
++                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
++                    response_body.len(),
++                    response_body
++                );
++                let _ = socket.write_all(response.as_bytes()).await;
++            }
++        });
++
++        let script = r#"IFS= read -r line
++printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"live-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"adapter reply"}}}}'
++printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'"#;
++        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
++            .await
++            .expect("spawn reply ACP script");
++        let channel_id = Uuid::new_v4();
++        let mut agent = OwnedAgent {
++            index: 0,
++            acp,
++            state: SessionState::default(),
++            model_capabilities: None,
++            desired_model: None,
++            model_overridden: false,
++            agent_name: "legacy-test-agent".into(),
++            goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
++            protocol_version: 1,
++        };
++        agent
++            .state
++            .sessions
++            .insert(channel_id, "live-session".into());
++        agent.state.loaded_sessions.insert(channel_id);
++        agent
++            .state
++            .deliveries
++            .insert(channel_id, ChannelDeliveryState::default());
++
++        let trigger = EventBuilder::new(Kind::Custom(9), "trigger")
++            .sign_with_keys(&Keys::generate())
++            .unwrap();
++        let trigger_id = trigger.id.to_hex();
++        let batch = FlushBatch {
++            channel_id,
++            events: vec![crate::queue::BatchEvent {
++                event: trigger,
++                prompt_tag: "test".into(),
++                received_at: std::time::Instant::now(),
++            }],
++            cancelled_events: vec![],
++            cancel_reason: None,
++        };
++
++        let mut ctx = make_prompt_context_no_owner();
++        ctx.rest_client.base_url = base_url;
++        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
++        run_prompt_task(
++            agent,
++            Some(batch),
++            None,
++            Arc::new(ctx),
++            result_tx,
++            None,
++            "reply-turn".into(),
++        )
++        .await;
++        let mut result = result_rx.recv().await.expect("prompt result");
++        assert!(matches!(
++            result.outcome,
++            PromptOutcome::Ok(StopReason::EndTurn)
++        ));
++        result.agent.acp.shutdown().await;
++
++        let mut posted_reply = None;
++        for _ in 0..8 {
++            let Ok(Some(event)) =
++                tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await
++            else {
++                continue;
++            };
++            if event.get("kind") == Some(&json!(9))
++                && event.get("content") == Some(&json!("adapter reply"))
++            {
++                posted_reply = Some(event);
++                break;
++            }
++        }
++        server.abort();
++
++        let posted_reply = posted_reply.expect("assistant reply event submitted");
++        let tags = posted_reply["tags"].as_array().expect("reply tags");
++        assert!(tags.iter().any(|tag| tag == &json!(["h", channel_id.to_string()])));
++        assert!(tags
++            .iter()
++            .any(|tag| tag == &json!(["e", trigger_id, "", "reply"])));
++    }
++
+     #[tokio::test]
+     async fn merged_cancel_prompt_commits_and_deduplicates_all_rendered_event_ids() {
+         use tokio::io::{AsyncReadExt, AsyncWriteExt};

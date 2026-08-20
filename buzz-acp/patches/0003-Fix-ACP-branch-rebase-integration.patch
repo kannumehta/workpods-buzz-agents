@@ -1,0 +1,162 @@
+From 91f6e59e8cbd63114114d493477eac4dc945db34 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Mon, 17 Aug 2026 02:43:28 +0000
+Subject: [PATCH 3/6] Fix ACP branch rebase integration
+
+---
+ crates/buzz-acp/src/lib.rs   |  1 +
+ crates/buzz-acp/src/pool.rs  | 31 +++++++++++++++++++++++++------
+ crates/buzz-acp/src/queue.rs |  5 ++---
+ 3 files changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index a75371017..213ba0c35 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -5639,6 +5639,7 @@ mod session_control_command_tests {
+             relay_observer: false,
+             exit_after_inactivity_secs: 0,
+             lazy_pool: false,
++            idle_pool_sleep_secs: 0,
+             agent_owner: Some(OWNER.to_string()),
+             no_base_prompt: false,
+             base_prompt_content: None,
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 33f0319b4..90732ed8d 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -92,7 +92,7 @@ pub struct AgentModelCapabilities {
+ }
+ 
+ /// Successful deliveries associated with one live channel session.
+-#[derive(Default)]
++#[derive(Debug, Clone, Default)]
+ pub struct ChannelDeliveryState {
+     /// Whether a legacy user message has successfully carried standing context.
+     pub standing_context_sent: bool,
+@@ -1204,7 +1204,7 @@ async fn create_session_and_apply_model(
+     agent_core: Option<&str>,
+     channel: NewSessionChannelContext<'_>,
+ ) -> Result<String, AcpError> {
+-    let session_override = channel_id.and_then(|cid| {
++    let session_override = channel.id.and_then(|cid| {
+         ctx.session_overrides
+             .lock()
+             .ok()
+@@ -2089,10 +2089,13 @@ pub async fn run_prompt_task(
+                                 &mut agent,
+                                 &ctx,
+                                 agent_core.as_deref(),
+-                                agent_canvas.as_deref(),
+-                                title_channel.as_deref(),
+-                                Some(*cid),
+-                                origin_channel_type.as_deref(),
++                                NewSessionChannelContext {
++                                    huddle_instructions: huddle_instructions.as_deref(),
++                                    canvas: agent_canvas.as_deref(),
++                                    name: title_channel.as_deref(),
++                                    id: Some(*cid),
++                                    channel_type: origin_channel_type.as_deref(),
++                                },
+                             )
+                             .await
+                             {
+@@ -2102,6 +2105,11 @@ pub async fn run_prompt_task(
+                                         "created session {new_sid} for channel {cid}"
+                                     );
+                                     agent.state.sessions.insert(*cid, new_sid.clone());
++                                    agent
++                                        .state
++                                        .deliveries
++                                        .insert(*cid, ChannelDeliveryState::default());
++                                    agent.acp.notify_session_spawned(&new_sid);
+                                     agent.state.loaded_sessions.insert(*cid);
+                                     if let Some((pending_cid, section)) = pending_canvas.take() {
+                                         agent.state.canvas_sections.insert(pending_cid, section);
+@@ -6395,6 +6403,8 @@ done"#
+             model_overridden: false,
+             agent_name: "legacy-test-agent".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 1,
+         };
+         agent.state.heartbeat_session = Some("live-session".into());
+@@ -6489,12 +6499,15 @@ done"#
+             model_overridden: false,
+             agent_name: "legacy-test-agent".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 1,
+         };
+         agent
+             .state
+             .sessions
+             .insert(channel_id, "live-session".into());
++        agent.state.loaded_sessions.insert(channel_id);
+         agent
+             .state
+             .deliveries
+@@ -6661,12 +6674,15 @@ done"#
+             model_overridden: false,
+             agent_name: "legacy-test-agent".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 1,
+         };
+         agent
+             .state
+             .sessions
+             .insert(channel_id, "live-session".into());
++        agent.state.loaded_sessions.insert(channel_id);
+         agent
+             .state
+             .deliveries
+@@ -6811,12 +6827,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             model_overridden: false,
+             agent_name: "legacy-test-agent".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 1,
+         };
+         agent
+             .state
+             .sessions
+             .insert(channel_id, "live-session".into());
++        agent.state.loaded_sessions.insert(channel_id);
+         agent
+             .state
+             .deliveries
+diff --git a/crates/buzz-acp/src/queue.rs b/crates/buzz-acp/src/queue.rs
+index e456eebc8..d316f8d4f 100644
+--- a/crates/buzz-acp/src/queue.rs
++++ b/crates/buzz-acp/src/queue.rs
+@@ -1217,7 +1217,6 @@ fn format_context_hints(
+              Channel: {channel_display}\n\
+              {ctx_hint}"
+         );
+-        append_channel_description(&mut s, channel_info);
+         s
+     } else if thread_tags.root_event_id.is_some() {
+         let ctx_hint = if has_conversation_context {
+@@ -3455,7 +3454,7 @@ mod tests {
+         };
+ 
+         let trigger_only_prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+-        assert!(trigger_only_prompt.contains("fetch thread context"));
++        assert!(trigger_only_prompt.contains("This message is part of a thread."));
+         assert!(!trigger_only_prompt.contains("already delivered in this session"));
+ 
+         let prompt = format_prompt(
+@@ -3500,7 +3499,7 @@ mod tests {
+             },
+         )
+         .join("\n\n");
+-        assert!(trigger_only_prompt.contains("for conversation context"));
++        assert!(trigger_only_prompt.contains("This is a direct message."));
+         assert!(!trigger_only_prompt.contains("already delivered in this session"));
+ 
+         let prompt = format_prompt(

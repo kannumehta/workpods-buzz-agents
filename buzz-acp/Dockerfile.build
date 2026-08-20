@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1.7
+FROM rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c AS build
+
+ARG UPSTREAM_URL=https://github.com/block/buzz.git
+ARG UPSTREAM_REV=f956e6fe06a76e50cbd8fba1a162482e752e7f1a
+ARG PATCH_HEAD=93c2651d0210bc91526272f9447fc6a93a2b482a
+ARG PATCH_TREE=c055f1f53a7f1c3b24b189c5d2a49eeb24858578
+ARG RUST_IMAGE=rust@sha256:443dd9a3260cf23c22fc05051dd5661dd7b4028d3d25dbaffab6563b63c3539c
+ARG RUST_TOOLCHAIN=1.95.0
+
+WORKDIR /src
+RUN test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN" \
+    && git init \
+    && git remote add origin "$UPSTREAM_URL" \
+    && git fetch --depth=1 origin "$UPSTREAM_REV" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "$UPSTREAM_REV"
+
+COPY buzz-acp/patches /patches
+RUN test "$(find /patches -maxdepth 1 -name '*.patch' | wc -l)" -eq 6 \
+    && git config user.name 'WorkPods Build' \
+    && git config user.email 'build@workpods.invalid' \
+    && git am /patches/*.patch \
+    && test "$(git rev-parse HEAD^{tree})" = "$PATCH_TREE"
+
+RUN cargo test --locked -p buzz-acp \
+    && cargo build --locked --release -p buzz-acp -p buzz-cli
+
+RUN set -eu; \
+    install -d /out; \
+    install -m 0755 target/release/buzz /out/buzz; \
+    install -m 0755 target/release/buzz-acp /out/buzz-acp; \
+    cd /out; \
+    sha256sum buzz buzz-acp > SHA256SUMS; \
+    patched_tree="$(git -C /src rev-parse HEAD^{tree})"; \
+    cargo_lock_sha="$(sha256sum /src/Cargo.lock | awk '{print $1}')"; \
+    buzz_sha="$(sha256sum buzz | awk '{print $1}')"; \
+    acp_sha="$(sha256sum buzz-acp | awk '{print $1}')"; \
+    patch_json="$(cd /patches && sha256sum *.patch | awk 'BEGIN { printf "[" } { if (NR > 1) printf ","; printf "{\"file\":\"%s\",\"sha256\":\"%s\"}", $2, $1 } END { print "]" }')"; \
+    printf '%s\n' \
+      '{' \
+      "  \"upstream_url\": \"$UPSTREAM_URL\"," \
+      "  \"upstream_revision\": \"$UPSTREAM_REV\"," \
+      "  \"patch_head\": \"$PATCH_HEAD\"," \
+      "  \"patched_tree\": \"$patched_tree\"," \
+      "  \"patches\": $patch_json," \
+      "  \"rust_image\": \"$RUST_IMAGE\"," \
+      "  \"rust_toolchain\": \"$RUST_TOOLCHAIN\"," \
+      "  \"cargo_lock_sha256\": \"$cargo_lock_sha\"," \
+      "  \"artifacts\": {\"buzz\": \"$buzz_sha\", \"buzz-acp\": \"$acp_sha\"}" \
+      '}' > provenance.json
+
+FROM scratch AS export
+COPY --from=build /out /

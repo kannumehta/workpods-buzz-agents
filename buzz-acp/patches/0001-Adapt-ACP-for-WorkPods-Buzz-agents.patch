@@ -1,0 +1,2529 @@
+From ea63e88ed0aebfc9570f2cf6ee68e90fd0d17551 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Mon, 17 Aug 2026 01:30:49 +0000
+Subject: [PATCH 1/6] Adapt ACP for WorkPods Buzz agents
+
+---
+ AGENTS.md                          |   8 +
+ crates/buzz-acp/src/acp.rs         |  91 ++++-
+ crates/buzz-acp/src/base_prompt.md |   3 +-
+ crates/buzz-acp/src/config.rs      | 199 ++++++----
+ crates/buzz-acp/src/lib.rs         | 347 ++++++++++++++++-
+ crates/buzz-acp/src/pool.rs        | 276 ++++++++++++--
+ crates/buzz-acp/src/queue.rs       | 588 ++++++++---------------------
+ 7 files changed, 942 insertions(+), 570 deletions(-)
+
+diff --git a/AGENTS.md b/AGENTS.md
+index d66ecbdc7..8115a40b1 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -51,6 +51,14 @@ access information.
+ 
+ ---
+ 
++## Multi-Agent Collaboration
++
++This is a multi-agent collaboration project. Agents must always prefer a git
++worktree and a new branch for repository work, and use issues to track
++non-trivial tasks, coordination points, and follow-up work.
++
++---
++
+ ## Repo Structure
+ 
+ ```
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index f04b8eeec..5c75b9ba5 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -214,6 +214,8 @@ pub struct AcpClient {
+     standard_usage: StandardUsageTracker,
+     /// Known adapter identity for prompt-response usage mapping.
+     standard_adapter: Option<StandardAdapterKind>,
++    /// Assistant text streamed during the current `session/prompt` turn.
++    last_assistant_text: String,
+ }
+ 
+ /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
+@@ -515,6 +517,9 @@ impl AcpClient {
+         if let Some(merged) = codex_config_value {
+             cmd.env("CODEX_CONFIG", merged);
+         }
++        if env_truthy("BUZZ_ACP_STRIP_AGENT_BUZZ_ENV") {
++            strip_buzz_env(&mut cmd);
++        }
+ 
+         // Spawn the agent in its own process group so SIGKILL doesn't propagate
+         // to the harness's own process group on Unix.
+@@ -563,6 +568,7 @@ impl AcpClient {
+             goose_usage: UsageTracker::default(),
+             standard_usage: StandardUsageTracker::default(),
+             standard_adapter,
++            last_assistant_text: String::new(),
+         })
+     }
+ 
+@@ -631,7 +637,8 @@ impl AcpClient {
+ 
+     /// Send `session/new` and return the full response alongside the session ID.
+     ///
+-    /// `cwd` must be an absolute path. `mcp_servers` may be empty.
++    /// `cwd` must be an absolute path. `additional_directories` and
++    /// `mcp_servers` may be empty.
+     ///
+     /// `system_prompt` controls how the prompt text is delivered:
+     ///
+@@ -651,6 +658,7 @@ impl AcpClient {
+     pub async fn session_new_full(
+         &mut self,
+         cwd: &str,
++        additional_directories: &[String],
+         mcp_servers: Vec<McpServer>,
+         system_prompt: Option<SystemPromptTransport<'_>>,
+         session_title: Option<&str>,
+@@ -659,6 +667,9 @@ impl AcpClient {
+             "cwd": cwd,
+             "mcpServers": mcp_servers,
+         });
++        if !additional_directories.is_empty() {
++            params["additionalDirectories"] = serde_json::json!(additional_directories);
++        }
+         match system_prompt {
+             Some(SystemPromptTransport::Field(sp)) => {
+                 params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+@@ -697,7 +708,7 @@ impl AcpClient {
+         session_title: Option<&str>,
+     ) -> Result<String, AcpError> {
+         Ok(self
+-            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
++            .session_new_full(cwd, &[], mcp_servers, system_prompt, session_title)
+             .await?
+             .session_id)
+     }
+@@ -784,6 +795,7 @@ impl AcpClient {
+         let params = build_prompt_params(session_id, prompt_blocks);
+         let hard_deadline = tokio::time::Instant::now() + max_duration;
+         self.current_hard_deadline = Some(hard_deadline);
++        self.last_assistant_text.clear();
+ 
+         // Mark the usage tracker as in-flight for this turn BEFORE sending the
+         // prompt so that any setup notifications recorded earlier are not
+@@ -901,6 +913,17 @@ impl AcpClient {
+         self.standard_usage.seed_zero_baseline(session_id);
+     }
+ 
++    /// Take the assistant text streamed during the most recent prompt turn.
++    pub(crate) fn take_last_assistant_text(&mut self) -> Option<String> {
++        let text = self.last_assistant_text.trim().to_string();
++        self.last_assistant_text.clear();
++        if text.is_empty() {
++            None
++        } else {
++            Some(text)
++        }
++    }
++
+     /// Install a per-turn steer request channel for goose-native
+     /// non-cancelling mid-turn delivery.
+     ///
+@@ -1755,6 +1778,7 @@ impl AcpClient {
+         match update_type {
+             "agent_message_chunk" => {
+                 if let Some(text) = update["content"]["text"].as_str() {
++                    self.last_assistant_text.push_str(text);
+                     tracing::info!(target: "acp::stream", "{text}");
+                 }
+                 false
+@@ -3404,6 +3428,7 @@ mod tests {
+         let resp = client
+             .session_new_full(
+                 "/tmp",
++                &[],
+                 vec![],
+                 Some(SystemPromptTransport::Field("Custom system prompt")),
+                 None,
+@@ -3492,7 +3517,7 @@ mod tests {
+             .expect("initialize should succeed");
+ 
+         let resp = client
+-            .session_new_full("/tmp", vec![], None, None)
++            .session_new_full("/tmp", &[], vec![], None, None)
+             .await
+             .expect("session_new_full should succeed");
+ 
+@@ -3504,6 +3529,41 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn session_new_full_includes_additional_directories_when_some() {
++        let script = r#"
++            read -t 2 _init
++            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
++            read -t 2 REQ
++            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_test","_receivedRequest":'"$REQ"'}}'
++            sleep 1
++        "#;
++        let mut client = spawn_script(script).await;
++        client
++            .initialize()
++            .await
++            .expect("initialize should succeed");
++
++        let additional = vec![
++            "/home/ubuntu/workpods-buzz".to_string(),
++            "/home/ubuntu/workpods-ingest".to_string(),
++        ];
++        let resp = client
++            .session_new_full("/tmp", &additional, vec![], None, None)
++            .await
++            .expect("session_new_full should succeed");
++
++        let received = &resp.raw["_receivedRequest"];
++        assert_eq!(
++            received["params"]["additionalDirectories"][0].as_str(),
++            Some("/home/ubuntu/workpods-buzz")
++        );
++        assert_eq!(
++            received["params"]["additionalDirectories"][1].as_str(),
++            Some("/home/ubuntu/workpods-ingest")
++        );
++    }
++
+     #[tokio::test]
+     async fn session_new_full_sends_session_title_in_meta_when_some() {
+         let script = r#"
+@@ -3520,7 +3580,7 @@ mod tests {
+             .expect("initialize should succeed");
+ 
+         let resp = client
+-            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
++            .session_new_full("/tmp", &[], vec![], None, Some("Fizz · #buzz-dev"))
+             .await
+             .expect("session_new_full should succeed");
+ 
+@@ -3548,7 +3608,7 @@ mod tests {
+             .expect("initialize should succeed");
+ 
+         let resp = client
+-            .session_new_full("/tmp", vec![], None, None)
++            .session_new_full("/tmp", &[], vec![], None, None)
+             .await
+             .expect("session_new_full should succeed");
+ 
+@@ -3581,6 +3641,7 @@ mod tests {
+         let resp = client
+             .session_new_full(
+                 "/tmp",
++                &[],
+                 vec![],
+                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                 None,
+@@ -3620,6 +3681,7 @@ mod tests {
+         let resp = client
+             .session_new_full(
+                 "/tmp",
++                &[],
+                 vec![],
+                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                 Some("Fizz · #buzz-dev"),
+@@ -4958,3 +5020,22 @@ mod tests {
+         );
+     }
+ }
++
++fn env_truthy(key: &str) -> bool {
++    std::env::var(key)
++        .map(|value| {
++            matches!(
++                value.trim().to_ascii_lowercase().as_str(),
++                "1" | "true" | "yes" | "on"
++            )
++        })
++        .unwrap_or(false)
++}
++
++fn strip_buzz_env(cmd: &mut tokio::process::Command) {
++    for (key, _) in std::env::vars_os() {
++        if key.to_string_lossy().starts_with("BUZZ") {
++            cmd.env_remove(key);
++        }
++    }
++}
+diff --git a/crates/buzz-acp/src/base_prompt.md b/crates/buzz-acp/src/base_prompt.md
+index 83b935717..b2b6b4514 100644
+--- a/crates/buzz-acp/src/base_prompt.md
++++ b/crates/buzz-acp/src/base_prompt.md
+@@ -75,7 +75,8 @@ All replies and delegations — including task assignments to other agents — g
+ ### General
+ 
+ - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
+-- **If your turn produced anything worth knowing, you MUST publish it.** Use `buzz messages send`. Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, a blocker, or a question you need answered exists only if you published it. Work or an answer that someone asked you for always counts. Ending that kind of turn without a message is a silent failure.
++- **If your turn produced anything worth knowing, you MUST answer in your final response.** The harness publishes your final assistant text to Buzz as your signed channel reply. Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, a blocker, or a question you need answered exists only if it appears in your final response. Work or an answer that someone asked you for always counts. Ending that kind of turn without a final response is a silent failure.
++- Use `buzz messages send` only when you intentionally need to create an additional Buzz message beyond the normal reply, such as opening a separate delegated subthread. Do not use it for the ordinary response to the message that triggered this turn.
+ - **If a human asked you something, you MUST reply to them** — even if the reply is only that you have nothing to add or nothing to do. Never leave a person waiting on you.
+ - **Otherwise, publishing is optional and silence is usually correct.** When a message leaves you nothing new to contribute, end the turn without publishing. That is a success, not a failure.
+ - **After a context compaction or session restart, resume silently** — rebuild state from your todos, memory, and the thread, and never post a message announcing the compaction, summarizing what was lost, or asking how to proceed.
+diff --git a/crates/buzz-acp/src/config.rs b/crates/buzz-acp/src/config.rs
+index f9e7bf1ed..ad101faa8 100644
+--- a/crates/buzz-acp/src/config.rs
++++ b/crates/buzz-acp/src/config.rs
+@@ -114,53 +114,46 @@ impl std::fmt::Display for RespondTo {
+ /// Permission mode for agents that support `session/set_config_option` with
+ /// `configId: "mode"` (e.g. `claude-agent-acp`).
+ ///
+-/// - `default` — agent's built-in behaviour (permission requests per tool call).
+-/// - `acceptEdits` — auto-approve file edits, still ask for other tools.
+-/// - `bypassPermissions` — skip the permission flow entirely.
+-/// - `dontAsk` — never prompt; reject anything that would require permission.
+ /// - `plan` — planning-only mode (no tool execution).
+-#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
++/// - `auto` — execute without interactive approval when the adapter supports it.
++/// - `edit` — allow file-edit operations, but keep broader tool checks.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+ pub enum PermissionMode {
+-    /// Agent default — permission requests per tool call.
+-    #[value(alias = "default")]
+-    Default,
+-    /// Auto-approve file edits, still ask for other tools.
+-    #[value(alias = "acceptEdits")]
+-    AcceptEdits,
+-    /// Skip the permission flow entirely.
+-    #[value(alias = "bypassPermissions")]
+-    BypassPermissions,
+-    /// Never prompt; reject anything that would require permission.
+-    #[value(alias = "dontAsk")]
+-    DontAsk,
+     /// Planning-only mode (no tool execution).
+     #[value(alias = "plan")]
+     Plan,
++    /// Execute without interactive approval when supported by the adapter.
++    #[value(alias = "bypassPermissions")]
++    #[value(alias = "bypass")]
++    Auto,
++    /// Auto-approve file edits, still ask for broader tools.
++    #[value(alias = "acceptEdits")]
++    Edit,
+ }
+ 
+ impl PermissionMode {
+-    /// Return the wire-format string sent to the agent via
+-    /// `session/set_config_option`.
+-    pub fn as_wire_str(&self) -> &'static str {
++    /// Return the user-facing mode string accepted by the Buzz client.
++    pub fn as_public_str(&self) -> &'static str {
+         match self {
+-            Self::Default => "default",
+-            Self::AcceptEdits => "acceptEdits",
+-            Self::BypassPermissions => "bypassPermissions",
+-            Self::DontAsk => "dontAsk",
+             Self::Plan => "plan",
++            Self::Auto => "auto",
++            Self::Edit => "edit",
+         }
+     }
+ 
+-    /// Returns `true` when the mode is the agent's built-in default and
+-    /// therefore doesn't need to be explicitly set.
+-    pub fn is_default(&self) -> bool {
+-        matches!(self, Self::Default)
++    /// Return adapter-specific wire modes in preference order.
++    pub fn preferred_wire_modes(&self) -> &'static [&'static str] {
++        match self {
++            Self::Plan => &["plan"],
++            Self::Auto => &["bypassPermissions", "auto"],
++            Self::Edit => &["acceptEdits"],
++        }
+     }
+ }
+ 
+ impl std::fmt::Display for PermissionMode {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        f.write_str(self.as_wire_str())
++        f.write_str(self.as_public_str())
+     }
+ }
+ 
+@@ -293,6 +286,15 @@ pub struct CliArgs {
+           value_parser = clap::value_parser!(u32).range(1..=32))]
+     pub agents: u32,
+ 
++    /// Additional absolute workspace directories to expose to ACP sessions.
++    /// Useful when the primary cwd contains symlinks to service checkouts.
++    #[arg(
++        long = "additional-directory",
++        env = "BUZZ_ACP_ADDITIONAL_DIRECTORIES",
++        value_delimiter = ','
++    )]
++    pub additional_directories: Vec<String>,
++
+     /// Seconds between heartbeat prompts. 0 = disabled.
+     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
+     pub heartbeat_interval: u64,
+@@ -432,13 +434,12 @@ pub struct CliArgs {
+     /// Permission mode for agents that support `session/set_config_option`
+     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
+     ///
+-    /// Defaults to `bypassPermissions` which skips the per-tool-call
+-    /// permission flow. Set to `default` to restore the agent's built-in
+-    /// behaviour.
++    /// Defaults to `plan`. Use `auto` for execution without interactive
++    /// approval where the adapter supports it, or `edit` for edit-only auto-accept.
+     #[arg(
+         long,
+         env = "BUZZ_ACP_PERMISSION_MODE",
+-        default_value = "bypass-permissions",
++        default_value = "plan",
+         value_enum
+     )]
+     pub permission_mode: PermissionMode,
+@@ -458,6 +459,12 @@ pub struct CliArgs {
+     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
+     pub respond_to_allowlist: Option<Vec<String>>,
+ 
++    /// Comma-separated 64-char hex pubkeys allowed to run harness control
++    /// slash commands such as /model and /mode. Owner is always implicit.
++    /// Same-owner sibling agents are intentionally not implicit here.
++    #[arg(long, env = "BUZZ_ACP_CONTROL_ALLOWLIST", value_delimiter = ',')]
++    pub control_allowlist: Option<Vec<String>>,
++
+     /// Comma-separated list of allowed `--respond-to` modes.
+     /// When set, the harness rejects startup if `--respond-to` is not in this list.
+     /// Modes: owner-only, allowlist, anyone, nobody.
+@@ -543,12 +550,17 @@ pub struct Config {
+     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
+     /// `None` when unset or when the configured value sanitized to empty.
+     pub session_title: Option<String>,
++    /// Additional absolute workspace directories passed to ACP `session/new`.
++    pub additional_directories: Vec<String>,
+     /// Permission mode to apply after session creation. `Default` = skip.
+     pub permission_mode: PermissionMode,
+     /// Inbound author gate mode.
+     pub respond_to: RespondTo,
+     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
+     pub respond_to_allowlist: HashSet<String>,
++    /// Validated allowlist for harness-owned session control slash commands.
++    /// Owner is implicit; siblings are not.
++    pub control_allowlist: HashSet<String>,
+     /// Allowed `respond_to` modes. Empty = all modes allowed.
+     pub allowed_respond_to: Vec<String>,
+     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
+@@ -659,6 +671,28 @@ fn validate_allowlist(entries: &[String]) -> Result<HashSet<String>, ConfigError
+     Ok(validated)
+ }
+ 
++fn validate_additional_directories(entries: &[String]) -> Result<Vec<String>, ConfigError> {
++    let mut seen = HashSet::new();
++    let mut validated = Vec::new();
++    for entry in entries {
++        let trimmed = entry.trim();
++        if trimmed.is_empty() {
++            continue;
++        }
++        let path = std::path::Path::new(trimmed);
++        if !path.is_absolute() {
++            return Err(ConfigError::ConfigFile(format!(
++                "invalid additional directory '{entry}': path must be absolute"
++            )));
++        }
++        let normalized = trimmed.trim_end_matches('/').to_string();
++        if seen.insert(normalized.clone()) {
++            validated.push(normalized);
++        }
++    }
++    Ok(validated)
++}
++
+ /// Validate the `--multiple-event-handling` / `--dedup` combination.
+ ///
+ /// Every mid-turn cancel mode (`Steer`, `Interrupt`, `OwnerInterrupt`) requires
+@@ -1028,6 +1062,10 @@ impl Config {
+             HashSet::new()
+         };
+ 
++        let control_allowlist = validate_allowlist(&args.control_allowlist.unwrap_or_default())?;
++        let additional_directories =
++            validate_additional_directories(&args.additional_directories)?;
++
+         // Validate respond_to against the allowed set.
+         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
+             // Validate each entry is a known RespondTo mode.
+@@ -1109,9 +1147,11 @@ impl Config {
+                 .session_title
+                 .as_deref()
+                 .and_then(sanitize_session_title),
++            additional_directories,
+             permission_mode: args.permission_mode,
+             respond_to: args.respond_to,
+             respond_to_allowlist,
++            control_allowlist,
+             allowed_respond_to,
+             persona_env_vars,
+             has_generated_codex_config,
+@@ -1143,7 +1183,7 @@ impl Config {
+             format!(" allowed_respond_to=[{}]", modes.join(","))
+         };
+         format!(
+-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
++            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} additional_dirs={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+             self.relay_url,
+             self.keys.public_key().to_hex(),
+             self.agent_command,
+@@ -1152,6 +1192,7 @@ impl Config {
+             self.idle_timeout_secs,
+             self.max_turn_duration_secs,
+             self.agents,
++            self.additional_directories.len(),
+             self.heartbeat_interval_secs,
+             self.subscribe_mode,
+             self.dedup_mode,
+@@ -1481,9 +1522,11 @@ mod tests {
+             memory_enabled: true,
+             model: None,
+             session_title: None,
+-            permission_mode: PermissionMode::BypassPermissions,
++            additional_directories: Vec::new(),
++            permission_mode: PermissionMode::Plan,
+             respond_to: RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
++            control_allowlist: HashSet::new(),
+             allowed_respond_to: Vec::new(),
+             persona_env_vars: vec![],
+             has_generated_codex_config: false,
+@@ -2296,106 +2339,100 @@ channels = "ALL"
+     }
+ 
+     #[test]
+-    fn test_permission_mode_wire_strings() {
+-        assert_eq!(PermissionMode::Default.as_wire_str(), "default");
+-        assert_eq!(PermissionMode::AcceptEdits.as_wire_str(), "acceptEdits");
+-        assert_eq!(
+-            PermissionMode::BypassPermissions.as_wire_str(),
+-            "bypassPermissions"
+-        );
+-        assert_eq!(PermissionMode::DontAsk.as_wire_str(), "dontAsk");
+-        assert_eq!(PermissionMode::Plan.as_wire_str(), "plan");
++    fn test_permission_mode_public_strings() {
++        assert_eq!(PermissionMode::Plan.as_public_str(), "plan");
++        assert_eq!(PermissionMode::Auto.as_public_str(), "auto");
++        assert_eq!(PermissionMode::Edit.as_public_str(), "edit");
+     }
+ 
+     #[test]
+-    fn test_permission_mode_is_default() {
+-        assert!(PermissionMode::Default.is_default());
+-        assert!(!PermissionMode::BypassPermissions.is_default());
+-        assert!(!PermissionMode::AcceptEdits.is_default());
+-        assert!(!PermissionMode::DontAsk.is_default());
+-        assert!(!PermissionMode::Plan.is_default());
++    fn test_permission_mode_adapter_mappings() {
++        assert_eq!(PermissionMode::Plan.preferred_wire_modes(), &["plan"]);
++        assert_eq!(
++            PermissionMode::Auto.preferred_wire_modes(),
++            &["bypassPermissions", "auto"]
++        );
++        assert_eq!(PermissionMode::Edit.preferred_wire_modes(), &["acceptEdits"]);
+     }
+ 
+     #[test]
+     fn test_permission_mode_display() {
+-        assert_eq!(
+-            format!("{}", PermissionMode::BypassPermissions),
+-            "bypassPermissions"
+-        );
+-        assert_eq!(format!("{}", PermissionMode::Default), "default");
++        assert_eq!(format!("{}", PermissionMode::Plan), "plan");
++        assert_eq!(format!("{}", PermissionMode::Auto), "auto");
++        assert_eq!(format!("{}", PermissionMode::Edit), "edit");
+     }
+ 
+     #[test]
+     fn test_summary_includes_permission_mode() {
+         let mut config = test_config(SubscribeMode::Mentions);
+-        config.permission_mode = PermissionMode::BypassPermissions;
++        config.permission_mode = PermissionMode::Auto;
+         let s = config.summary();
+         assert!(
+-            s.contains("permission_mode=bypassPermissions"),
++            s.contains("permission_mode=auto"),
+             "summary should include permission_mode, got: {s}"
+         );
+     }
+ 
+     #[test]
+-    fn test_summary_permission_mode_default() {
++    fn test_summary_permission_mode_plan() {
+         let mut config = test_config(SubscribeMode::Mentions);
+-        config.permission_mode = PermissionMode::Default;
++        config.permission_mode = PermissionMode::Plan;
+         let s = config.summary();
+         assert!(
+-            s.contains("permission_mode=default"),
+-            "summary should show 'default', got: {s}"
++            s.contains("permission_mode=plan"),
++            "summary should show 'plan', got: {s}"
+         );
+     }
+ 
+     #[test]
+-    fn test_default_config_uses_bypass_permissions() {
++    fn test_default_config_uses_plan_mode() {
+         let config = test_config(SubscribeMode::Mentions);
+-        assert_eq!(config.permission_mode, PermissionMode::BypassPermissions);
++        assert_eq!(config.permission_mode, PermissionMode::Plan);
+     }
+ 
+     #[test]
+-    fn test_permission_mode_value_enum_kebab_case() {
+-        // clap::ValueEnum generates kebab-case by default from PascalCase variants.
+-        // Verify the parse path so variant renames don't silently break CLI/env parsing.
++    fn test_permission_mode_value_enum_public_values() {
+         use clap::ValueEnum;
+         let cases = [
+-            ("default", PermissionMode::Default),
+-            ("accept-edits", PermissionMode::AcceptEdits),
+-            ("bypass-permissions", PermissionMode::BypassPermissions),
+-            ("dont-ask", PermissionMode::DontAsk),
+             ("plan", PermissionMode::Plan),
++            ("auto", PermissionMode::Auto),
++            ("edit", PermissionMode::Edit),
+         ];
+         for (input, expected) in &cases {
+             assert_eq!(
+                 PermissionMode::from_str(input, true).unwrap(),
+                 *expected,
+-                "kebab-case {input:?} should parse"
++                "public value {input:?} should parse"
+             );
+         }
+     }
+ 
+     #[test]
+-    fn test_permission_mode_value_enum_camel_case_aliases() {
+-        // Operators may set env vars using the camelCase wire-format strings
+-        // (e.g. BUZZ_ACP_PERMISSION_MODE=bypassPermissions). The #[value(alias)]
+-        // attributes ensure these parse correctly.
++    fn test_permission_mode_accepts_internal_aliases_for_config_compatibility() {
+         use clap::ValueEnum;
+         let cases = [
+-            ("default", PermissionMode::Default),
+-            ("acceptEdits", PermissionMode::AcceptEdits),
+-            ("bypassPermissions", PermissionMode::BypassPermissions),
+-            ("dontAsk", PermissionMode::DontAsk),
+-            ("plan", PermissionMode::Plan),
++            ("acceptEdits", PermissionMode::Edit),
++            ("bypassPermissions", PermissionMode::Auto),
++            ("bypass", PermissionMode::Auto),
+         ];
+         for (input, expected) in &cases {
+             assert_eq!(
+                 PermissionMode::from_str(input, true).unwrap(),
+                 *expected,
+-                "camelCase alias {input:?} should parse"
++                "internal alias {input:?} should parse"
+             );
+         }
+     }
+ 
++    #[test]
++    fn test_permission_mode_rejects_removed_client_modes() {
++        use clap::ValueEnum;
++
++        for input in ["default", "dont-ask", "dontAsk"] {
++            assert!(PermissionMode::from_str(input, true).is_err());
++        }
++    }
++
+     /// Helper: resolve idle_timeout_secs using the same precedence logic as Config::from_args.
+     /// Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
+     fn resolve_idle_timeout(idle: Option<u64>, turn: Option<u64>) -> u64 {
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index 7fd40b83d..f25a468a4 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -31,14 +31,14 @@ use buzz_core::observer::{
+ use clap::Parser;
+ use config::{
+     AuthAgentArgs, AuthMethodsArgs, AuthenticateArgs, Config, DedupMode, ModelsArgs,
+-    MultipleEventHandling, RespondTo, SubscribeMode,
++    MultipleEventHandling, PermissionMode, RespondTo, SubscribeMode,
+ };
+ use filter::SubscriptionRule;
+ use futures_util::FutureExt;
+ use nostr::{PublicKey, ToBech32};
+ use pool::{
+     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
+-    PromptResult, PromptSource, SessionState, TimeoutKind,
++    PromptResult, PromptSource, SessionOverride, SessionState, TimeoutKind,
+ };
+ use pool_lifecycle::PoolLifecycle;
+ use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
+@@ -257,6 +257,80 @@ async fn author_allowed(
+     }
+ }
+ 
++/// Slash commands consumed by the harness instead of forwarded to the ACP
++/// adapter. These mutate only the current Buzz channel's runtime session.
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum SessionControlCommand {
++    SetModel(String),
++    SetMode(PermissionMode),
++    ShowSession,
++    ResetSession,
++}
++
++fn parse_permission_mode_arg(raw: &str) -> Option<PermissionMode> {
++    match raw {
++        "plan" => Some(PermissionMode::Plan),
++        "auto" => Some(PermissionMode::Auto),
++        "edit" => Some(PermissionMode::Edit),
++        _ => None,
++    }
++}
++
++fn parse_session_control_command(content: &str) -> Option<Result<SessionControlCommand, String>> {
++    let slash = queue::extract_slash_command(content, &[])?;
++    let mut parts = slash.split_whitespace();
++    let command = parts.next()?;
++    match command {
++        "/model" => {
++            let Some(model) = parts.next() else {
++                return Some(Err("Usage: /model <model-id>".into()));
++            };
++            if parts.next().is_some() {
++                return Some(Err("Usage: /model <model-id>".into()));
++            }
++            Some(Ok(SessionControlCommand::SetModel(model.to_string())))
++        }
++        "/mode" => {
++            let Some(mode) = parts.next() else {
++                return Some(Err("Usage: /mode <plan|auto|edit>".into()));
++            };
++            if parts.next().is_some() {
++                return Some(Err("Usage: /mode <plan|auto|edit>".into()));
++            }
++            match parse_permission_mode_arg(mode) {
++                Some(mode) => Some(Ok(SessionControlCommand::SetMode(mode))),
++                None => Some(Err("Unknown mode. Use one of: plan, auto, edit.".into())),
++            }
++        }
++        "/session" => Some(Ok(SessionControlCommand::ShowSession)),
++        "/reset-session" => {
++            if parts.next().is_some() {
++                return Some(Err("Usage: /reset-session".into()));
++            }
++            Some(Ok(SessionControlCommand::ResetSession))
++        }
++        _ => None,
++    }
++}
++
++/// Control commands are stricter than normal prompt admission: owner or an
++/// explicit allowlist entry only. Same-owner sibling agents can prompt, but
++/// cannot change model/mode. DMs stay owner-only for control commands.
++fn session_control_author_allowed(
++    config: &Config,
++    owner_cache: &OwnerCache,
++    author: &str,
++    is_dm: bool,
++) -> bool {
++    if owner_cache.get() == Some(author) {
++        return true;
++    }
++    if is_dm {
++        return false;
++    }
++    config.control_allowlist.contains(author)
++}
++
+ /// Resolve whether `channel_id` is a DM, for the inbound author gate.
+ ///
+ /// Resolution order:
+@@ -2182,11 +2256,13 @@ async fn tokio_main() -> Result<()> {
+             .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+             .to_string_lossy()
+             .to_string(),
++        additional_directories: config.additional_directories.clone(),
+         rest_client: relay.rest_client(),
+         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
+         context_message_limit: config.context_message_limit,
+         max_turns_per_session: config.max_turns_per_session,
+         permission_mode: config.permission_mode,
++        session_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+         agent_keys: config.keys.clone(),
+         agent_owner_pubkey: startup_owner
+             .as_deref()
+@@ -2875,6 +2951,143 @@ async fn tokio_main() -> Result<()> {
+                             // buzz_event.event (needed for mode gate below).
+                             let author_hex = buzz_event.event.pubkey.to_hex();
+                             let event_id_hex = buzz_event.event.id.to_hex();
++
++                            if kind_u32 == KIND_STREAM_MESSAGE {
++                                if let Some(command) =
++                                    parse_session_control_command(&buzz_event.event.content)
++                                {
++                                    let is_dm = is_dm_channel(
++                                        buzz_event.channel_id,
++                                        &ctx.channel_info,
++                                    )
++                                    .await;
++                                    let allowed = session_control_author_allowed(
++                                        &config,
++                                        &owner_cache,
++                                        &author_hex,
++                                        is_dm,
++                                    );
++                                    let notice = if !allowed {
++                                        "Only the owner or an explicit allowlist member can change this agent session.".to_string()
++                                    } else {
++                                        match command {
++                                            Err(message) => message,
++                                            Ok(SessionControlCommand::SetModel(model)) => {
++                                                match pool.idle_channel_model_supported(
++                                                    buzz_event.channel_id,
++                                                    &model,
++                                                ) {
++                                                    Some(false) => format!(
++                                                        "Model `{model}` is not available for this agent."
++                                                    ),
++                                                    _ => {
++                                                        if let Ok(mut overrides) =
++                                                            ctx.session_overrides.lock()
++                                                        {
++                                                            overrides
++                                                                .entry(buzz_event.channel_id)
++                                                                .or_insert_with(SessionOverride::default)
++                                                                .model = Some(model.clone());
++                                                        }
++                                                        let fired = signal_in_flight_task(
++                                                            &mut pool,
++                                                            buzz_event.channel_id,
++                                                            ControlSignal::ReconfigureSession,
++                                                        );
++                                                        if !fired {
++                                                            pool.invalidate_channel_sessions(
++                                                                buzz_event.channel_id,
++                                                            );
++                                                        }
++                                                        format!(
++                                                            "Session model set to `{model}` for this channel."
++                                                        )
++                                                    }
++                                                }
++                                            }
++                                            Ok(SessionControlCommand::SetMode(mode)) => {
++                                                if let Ok(mut overrides) =
++                                                    ctx.session_overrides.lock()
++                                                {
++                                                    overrides
++                                                        .entry(buzz_event.channel_id)
++                                                        .or_insert_with(SessionOverride::default)
++                                                        .permission_mode = Some(mode);
++                                                }
++                                                let fired = signal_in_flight_task(
++                                                    &mut pool,
++                                                    buzz_event.channel_id,
++                                                    ControlSignal::ReconfigureSession,
++                                                );
++                                                if !fired {
++                                                    pool.invalidate_channel_sessions(
++                                                        buzz_event.channel_id,
++                                                    );
++                                                }
++                                                format!(
++                                                    "Session mode set to `{mode}` for this channel."
++                                                )
++                                            }
++                                            Ok(SessionControlCommand::ShowSession) => {
++                                                let override_snapshot = ctx
++                                                    .session_overrides
++                                                    .lock()
++                                                    .ok()
++                                                    .and_then(|overrides| {
++                                                        overrides
++                                                            .get(&buzz_event.channel_id)
++                                                            .cloned()
++                                                    })
++                                                    .unwrap_or_default();
++                                                let model = override_snapshot
++                                                    .model
++                                                    .as_deref()
++                                                    .or(config.model.as_deref())
++                                                    .unwrap_or("agent default");
++                                                let mode = override_snapshot
++                                                    .permission_mode
++                                                    .unwrap_or(config.permission_mode);
++                                                format!(
++                                                    "Session config for this channel: model=`{model}`, mode=`{mode}`."
++                                                )
++                                            }
++                                            Ok(SessionControlCommand::ResetSession) => {
++                                                if let Ok(mut overrides) =
++                                                    ctx.session_overrides.lock()
++                                                {
++                                                    overrides.remove(&buzz_event.channel_id);
++                                                }
++                                                let fired = signal_in_flight_task(
++                                                    &mut pool,
++                                                    buzz_event.channel_id,
++                                                    ControlSignal::ReconfigureSession,
++                                                );
++                                                if !fired {
++                                                    pool.invalidate_channel_sessions(
++                                                        buzz_event.channel_id,
++                                                    );
++                                                }
++                                                "Session overrides cleared for this channel."
++                                                    .to_string()
++                                            }
++                                        }
++                                    };
++                                    let rest = ctx.rest_client.clone();
++                                    let channel_id = buzz_event.channel_id;
++                                    let thread_tags =
++                                        queue::parse_thread_tags(&buzz_event.event);
++                                    tokio::spawn(async move {
++                                        pool::post_system_notice(
++                                            &rest,
++                                            channel_id,
++                                            &thread_tags,
++                                            &notice,
++                                        )
++                                        .await;
++                                    });
++                                    continue;
++                                }
++                            }
+                             // Clone for the non-cancelling steer fork, which
+                             // needs the event to render the steer body. The
+                             // clone is unconditional because we don't know
+@@ -4886,7 +5099,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
+     // so shutdown() runs on all paths (success, error, timeout).
+     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
+         let init = client.initialize().await?;
+-        let session = client.session_new_full(&cwd, vec![], None, None).await?;
++        let session = client.session_new_full(&cwd, &[], vec![], None, None).await?;
+         Ok::<_, acp::AcpError>((init, session))
+     })
+     .await;
+@@ -5298,6 +5511,126 @@ mod owner_cache_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod session_control_command_tests {
++    use super::*;
++
++    const OWNER: &str = "00";
++    const SIBLING: &str = "11";
++    const ALLOWLISTED: &str = "22";
++
++    fn test_config() -> Config {
++        let mut respond_to_allowlist = HashSet::new();
++        respond_to_allowlist.insert(ALLOWLISTED.to_string());
++        let mut control_allowlist = HashSet::new();
++        control_allowlist.insert(ALLOWLISTED.to_string());
++        Config {
++            keys: nostr::Keys::generate(),
++            relay_url: "ws://localhost:3000".into(),
++            agent_command: "goose".into(),
++            agent_args: vec!["acp".into()],
++            mcp_command: String::new(),
++            idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
++            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
++            agents: 1,
++            heartbeat_interval_secs: 0,
++            turn_liveness_secs: 10,
++            heartbeat_prompt: None,
++            system_prompt: None,
++            team_instructions: None,
++            initial_message: None,
++            subscribe_mode: config::SubscribeMode::All,
++            dedup_mode: config::DedupMode::Queue,
++            multiple_event_handling: config::MultipleEventHandling::Queue,
++            ignore_self: true,
++            kinds_override: None,
++            channels_override: None,
++            no_mention_filter: false,
++            config_path: std::path::PathBuf::from("./buzz-acp.toml"),
++            context_message_limit: 12,
++            max_turns_per_session: 0,
++            presence_enabled: true,
++            typing_enabled: true,
++            memory_enabled: false,
++            model: None,
++            session_title: None,
++            additional_directories: vec![],
++            permission_mode: config::PermissionMode::Plan,
++            respond_to: config::RespondTo::Allowlist,
++            respond_to_allowlist,
++            control_allowlist,
++            allowed_respond_to: vec![],
++            persona_env_vars: vec![],
++            has_generated_codex_config: false,
++            relay_observer: false,
++            exit_after_inactivity_secs: 0,
++            lazy_pool: false,
++            agent_owner: Some(OWNER.to_string()),
++            no_base_prompt: false,
++            base_prompt_content: None,
++        }
++    }
++
++    #[test]
++    fn parses_reserved_session_commands_after_mentions() {
++        assert_eq!(
++            parse_session_control_command("@claude /model sonnet").unwrap().unwrap(),
++            SessionControlCommand::SetModel("sonnet".into())
++        );
++        assert_eq!(
++            parse_session_control_command("@codex /mode auto")
++                .unwrap()
++                .unwrap(),
++            SessionControlCommand::SetMode(PermissionMode::Auto)
++        );
++        assert_eq!(
++            parse_session_control_command("@claude /mode edit")
++                .unwrap()
++                .unwrap(),
++            SessionControlCommand::SetMode(PermissionMode::Edit)
++        );
++        assert_eq!(
++            parse_session_control_command("nostr:npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv8h6x /session")
++                .unwrap()
++                .unwrap(),
++            SessionControlCommand::ShowSession
++        );
++        assert_eq!(
++            parse_session_control_command("@claude /goal ship it"),
++            None
++        );
++        assert!(parse_session_control_command("@claude /mode turbo")
++            .unwrap()
++            .is_err());
++    }
++
++    #[test]
++    fn control_auth_is_owner_or_explicit_allowlist_not_sibling() {
++        let config = test_config();
++        let cache = OwnerCache::new(Some(OWNER.into()));
++        cache.cache_sibling(SIBLING.into(), true);
++
++        assert!(session_control_author_allowed(
++            &config, &cache, OWNER, false
++        ));
++        assert!(session_control_author_allowed(
++            &config,
++            &cache,
++            ALLOWLISTED,
++            false
++        ));
++        assert!(!session_control_author_allowed(
++            &config, &cache, SIBLING, false
++        ));
++        assert!(!session_control_author_allowed(
++            &config,
++            &cache,
++            ALLOWLISTED,
++            true
++        ));
++    }
++}
++
+ #[cfg(test)]
+ mod author_gate_tests {
+     use super::*;
+@@ -6752,9 +7085,11 @@ mod build_mcp_servers_tests {
+             memory_enabled: false,
+             model: None,
+             session_title: None,
+-            permission_mode: config::PermissionMode::BypassPermissions,
++            additional_directories: vec![],
++            permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: std::collections::HashSet::new(),
++            control_allowlist: std::collections::HashSet::new(),
+             allowed_respond_to: vec![],
+             persona_env_vars: vec![],
+             has_generated_codex_config: false,
+@@ -6975,9 +7310,11 @@ mod error_outcome_emission_tests {
+             memory_enabled: false,
+             model: None,
+             session_title: None,
+-            permission_mode: config::PermissionMode::BypassPermissions,
++            additional_directories: vec![],
++            permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
++            control_allowlist: HashSet::new(),
+             allowed_respond_to: vec![],
+             persona_env_vars: vec![],
+             has_generated_codex_config: false,
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 2efacce2b..a91e64459 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -213,6 +213,18 @@ pub struct OwnedAgent {
+     pub protocol_version: u32,
+ }
+ 
++/// Runtime-only model/mode override for one Buzz channel session.
++///
++/// The key is the channel UUID. Overrides are intentionally not persisted:
++/// restarting the harness returns the channel to the configured defaults.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct SessionOverride {
++    pub model: Option<String>,
++    pub permission_mode: Option<PermissionMode>,
++}
++
++pub type SessionOverrides = Arc<Mutex<HashMap<Uuid, SessionOverride>>>;
++
+ /// Package name reported by `claude-agent-acp` in its `initialize` response.
+ /// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
+ /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
+@@ -299,12 +311,11 @@ fn apply_completed_before_control_signal(
+     source: &PromptSource,
+     control_signal: &ControlSignal,
+ ) {
+-    // Rotate and SwitchModel both invalidate so the next turn creates a fresh
+-    // session. For SwitchModel the caller has already set `desired_model`, so
+-    // the fresh session applies the new model on its next creation.
++    // Rotate and runtime reconfiguration both invalidate so the next turn
++    // creates a fresh session with the updated settings.
+     if matches!(
+         control_signal,
+-        ControlSignal::Rotate | ControlSignal::SwitchModel(_)
++        ControlSignal::Rotate | ControlSignal::SwitchModel(_) | ControlSignal::ReconfigureSession
+     ) {
+         state.invalidate(source);
+     }
+@@ -336,6 +347,9 @@ pub enum ControlSignal {
+     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
+     /// — never persisted, gone on restart/respawn.
+     SwitchModel(String),
++    /// Recreate the channel session so slash-command model/mode overrides
++    /// stored in [`PromptContext::session_overrides`] take effect.
++    ReconfigureSession,
+ }
+ 
+ /// Goose-native non-cancelling steer request, sent from the main loop to an
+@@ -577,6 +591,8 @@ pub struct PromptContext {
+     /// (`include_str!`) is inherently `'static`.
+     pub base_prompt: Option<&'static str>,
+     pub cwd: String,
++    /// Additional absolute workspace roots exposed to ACP sessions.
++    pub additional_directories: Vec<String>,
+     /// REST client for pre-prompt context fetches (thread/DM history).
+     pub rest_client: RestClient,
+     /// Shared channel metadata for startup-known and dynamically joined channels.
+@@ -587,6 +603,8 @@ pub struct PromptContext {
+     pub max_turns_per_session: u32,
+     /// Permission mode to apply after session creation. `Default` = skip.
+     pub permission_mode: PermissionMode,
++    /// Runtime-only per-channel session overrides set by Buzz slash commands.
++    pub session_overrides: SessionOverrides,
+     /// Agent identity — used to derive the NIP-AE conversation key at
+     /// session creation for core injection.
+     pub agent_keys: nostr::Keys,
+@@ -827,6 +845,29 @@ impl AgentPool {
+         count
+     }
+ 
++    /// Check an idle channel session's cached model catalog, when available.
++    ///
++    /// `None` means there is no idle session/catalog yet, so callers should
++    /// accept the override and let fresh session creation perform final
++    /// validation against the adapter's live `session/new` response.
++    pub fn idle_channel_model_supported(
++        &self,
++        channel_id: Uuid,
++        model_id: &str,
++    ) -> Option<bool> {
++        let agent = self
++            .agents
++            .iter()
++            .flatten()
++            .find(|a| a.state.sessions.contains_key(&channel_id))?;
++        let caps = agent.model_capabilities.as_ref()?;
++        Some(model_in_catalog(
++            &caps.config_options_raw,
++            caps.available_models_raw.as_ref(),
++            model_id,
++        ))
++    }
++
+     /// Idle-path model switch: set `desired_model` on the idle agent for
+     /// `channel_id` and invalidate its session so the next turn re-creates the
+     /// session under the new model.
+@@ -972,6 +1013,13 @@ async fn create_session_and_apply_model(
+     agent_core: Option<&str>,
+     channel: NewSessionChannelContext<'_>,
+ ) -> Result<String, AcpError> {
++    let session_override = channel_id.and_then(|cid| {
++        ctx.session_overrides
++            .lock()
++            .ok()
++            .and_then(|overrides| overrides.get(&cid).cloned())
++    });
++
+     // Build base_prompt + system_prompt + agent core + canvas metadata into a
+     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
+     // Goose receives it through the custom request below. Legacy agents receive
+@@ -1008,6 +1056,7 @@ async fn create_session_and_apply_model(
+         .acp
+         .session_new_full(
+             &ctx.cwd,
++            &ctx.additional_directories,
+             mcp_servers,
+             session_new_system_prompt(
+                 is_goose,
+@@ -1050,7 +1099,11 @@ async fn create_session_and_apply_model(
+     // Apply desired_model if set, matching against the fresh session/new response.
+     // Track whether the switch succeeded so session_config_captured reflects
+     // the post-switch state (not the pre-switch desired state).
+-    let switch_succeeded = if let Some(ref desired) = agent.desired_model {
++    let desired_model = session_override
++        .as_ref()
++        .and_then(|session| session.model.as_ref())
++        .or(agent.desired_model.as_ref());
++    let switch_succeeded = if let Some(desired) = desired_model {
+         match resolve_model_switch_method(&resp.raw, desired) {
+             Some(method) => {
+                 apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+@@ -1091,21 +1144,29 @@ async fn create_session_and_apply_model(
+             "configOptions": resp.raw.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
+             "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
+             "models": resp.raw.get("models").cloned().unwrap_or(serde_json::Value::Null),
+-            "modelOverridden": agent.model_overridden && switch_succeeded,
++            "modelOverridden": (agent.model_overridden || session_override.as_ref().is_some_and(|session| session.model.is_some())) && switch_succeeded,
+             // Pair identity for the desktop session-config cache, which is
+             // keyed by (agent, relay) like the lifecycle frames.
+             "relayUrl": ctx.relay_url,
+         }),
+     );
+ 
+-    // Apply permission mode if not the agent's built-in default AND the agent
+-    // advertises the requested mode in session/new. Agents that don't support
+-    // the mode (e.g., goose crashes on unrecognized set_config_option values)
+-    // are safely skipped — the harness auto-approves via handle_permission_request.
+-    if !ctx.permission_mode.is_default()
+-        && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
+-    {
+-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
++    // Apply the public permission mode through the first adapter-specific wire
++    // mode this agent advertises. Agents that don't advertise a compatible mode
++    // are safely skipped; some adapters enforce execution policy at process
++    // launch instead of through ACP config options.
++    let permission_mode = session_override
++        .as_ref()
++        .and_then(|session| session.permission_mode)
++        .unwrap_or(ctx.permission_mode);
++    if let Some(wire_mode) = select_supported_permission_mode(&resp.raw, permission_mode) {
++        apply_permission_mode(&mut agent.acp, &resp.session_id, wire_mode).await?;
++    } else {
++        tracing::info!(
++            target: "pool::permission",
++            "session mode {permission_mode} has no advertised ACP mode for session {} — using adapter/process defaults",
++            resp.session_id
++        );
+     }
+ 
+     Ok(resp.session_id)
+@@ -1234,16 +1295,29 @@ fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str)
+         .unwrap_or(false)
+ }
+ 
+-/// per-tool auto-approval in `handle_permission_request`.
++fn select_supported_permission_mode(
++    session_new_result: &serde_json::Value,
++    mode: PermissionMode,
++) -> Option<&'static str> {
++    mode.preferred_wire_modes()
++        .iter()
++        .copied()
++        .find(|wire| agent_supports_mode(session_new_result, wire))
++}
++
++/// Set the session permission mode via `session/set_config_option`.
++///
++/// Non-fatal for most errors: logs and proceeds. The agent falls back to its
++/// default mode, and any interactive permission request is rejected by
++/// `handle_permission_request`.
+ ///
+ /// **Fatal exception:** if the agent process exits (e.g., goose crashes on
+ /// unrecognized methods), returns `Err(AgentExited)` so the caller can respawn.
+ async fn apply_permission_mode(
+     acp: &mut AcpClient,
+     session_id: &str,
+-    mode: &PermissionMode,
++    wire: &str,
+ ) -> Result<(), AcpError> {
+-    let wire = mode.as_wire_str();
+     let result = tokio::time::timeout(PERMISSION_MODE_TIMEOUT, async {
+         acp.session_set_config_option(session_id, "mode", wire)
+             .await
+@@ -2017,6 +2091,7 @@ pub async fn run_prompt_task(
+     // Event IDs represented by this prompt. Commit only after ACP reports a
+     // successful turn; failed/cancelled prompts must be retryable without loss.
+     let mut pending_delivered_event_ids = HashSet::new();
++    let mut reply_profiles: Option<PromptProfileLookup> = None;
+     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
+         // Heartbeats create their session before this point, so a Goose method-not-found
+         // probe has already selected the correct framing for this process.
+@@ -2078,6 +2153,7 @@ pub async fn run_prompt_task(
+ 
+         let profile_lookup =
+             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
++        reply_profiles = profile_lookup.clone();
+ 
+         let known_names: Vec<&str> = profile_lookup
+             .iter()
+@@ -2309,11 +2385,13 @@ pub async fn run_prompt_task(
+                         // MUST send a PromptResult or the main loop deadlocks.
+                         if matches!(
+                             control_signal,
+-                            ControlSignal::Rotate | ControlSignal::SwitchModel(_)
++                            ControlSignal::Rotate
++                                | ControlSignal::SwitchModel(_)
++                                | ControlSignal::ReconfigureSession
+                         ) {
+                             tracing::debug!(
+                                 target: "pool::prompt",
+-                                "rotate/switch signal arrived but turn already completed — invalidating session"
++                                "session-control signal arrived but turn already completed — invalidating session"
+                             );
+                         } else {
+                             tracing::debug!(
+@@ -2407,6 +2485,23 @@ pub async fn run_prompt_task(
+             }
+ 
+             let core_stop = acp_stop_to_core(&stop_reason);
++            if let (PromptSource::Channel(_), Some(ref b)) = (&source, batch.as_ref()) {
++                if let Some(reply_text) = agent.acp.take_last_assistant_text() {
++                    let mentions = resolve_reply_mentions(
++                        &reply_text,
++                        reply_profiles.as_ref(),
++                        &ctx.agent_keys.public_key().to_hex(),
++                    );
++                    post_agent_reply(
++                        &ctx.rest_client,
++                        b.channel_id,
++                        b,
++                        &reply_text,
++                        &mentions,
++                    )
++                    .await;
++                }
++            }
+             let usage = agent.acp.take_turn_usage();
+             publish_agent_turn_metric(
+                 &ctx,
+@@ -3691,7 +3786,9 @@ fn requeue_cancelled_batch(
+ ) -> Option<FlushBatch> {
+     let reason = match signal {
+         ControlSignal::Steer => CancelReason::Steer,
+-        ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,
++        ControlSignal::Interrupt
++        | ControlSignal::SwitchModel(_)
++        | ControlSignal::ReconfigureSession => CancelReason::Interrupt,
+         // Cancel/Rotate discard the batch — no merged re-prompt.
+         ControlSignal::Cancel | ControlSignal::Rotate => return None,
+     };
+@@ -4237,15 +4334,15 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
+     }
+ }
+ 
+-/// Best-effort: post a visible failure notice (kind:9) to a channel after a
+-/// batch is dead-lettered. Replies into the thread of `thread_tags` when the
+-/// triggering event was threaded. Errors are logged and swallowed — the
+-/// notice must never take down the main loop.
+-pub(crate) async fn post_failure_notice(
++/// Best-effort: post a visible harness notice (kind:9) to a channel. Replies
++/// into the thread of `thread_tags` when the triggering event was threaded.
++/// Errors are logged and swallowed — notices must never take down the loop.
++async fn post_visible_message(
+     rest: &crate::relay::RestClient,
+     channel_id: Uuid,
+     thread_tags: &ThreadTags,
+     content: &str,
++    mentions: &[String],
+ ) {
+     let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
+         let root_id = nostr::EventId::from_hex(root).ok()?;
+@@ -4259,28 +4356,131 @@ pub(crate) async fn post_failure_notice(
+             parent_event_id: parent_id,
+         })
+     });
+-    let builder =
+-        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
+-            Ok(b) => b,
+-            Err(e) => {
+-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
+-                return;
+-            }
+-        };
++    let mention_refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
++    let builder = match buzz_sdk::build_message(
++        channel_id,
++        content,
++        thread_ref.as_ref(),
++        &mention_refs,
++        false,
++        &[],
++    ) {
++        Ok(b) => b,
++        Err(e) => {
++            tracing::warn!(channel = %channel_id, "visible message: build failed: {e}");
++            return;
++        }
++    };
+     let event = match builder.sign_with_keys(&rest.keys) {
+         Ok(e) => e,
+         Err(e) => {
+-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
++            tracing::warn!(channel = %channel_id, "visible message: sign failed: {e}");
+             return;
+         }
+     };
+     match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+         Ok(Ok(_)) => {}
+-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
+-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
++        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "visible message failed: {e}"),
++        Err(_) => tracing::warn!(channel = %channel_id, "visible message timed out"),
+     }
+ }
+ 
++pub(crate) async fn post_system_notice(
++    rest: &crate::relay::RestClient,
++    channel_id: Uuid,
++    thread_tags: &ThreadTags,
++    content: &str,
++) {
++    post_visible_message(rest, channel_id, thread_tags, content, &[]).await;
++}
++
++fn reply_thread_tags_for_batch(batch: &FlushBatch) -> Option<ThreadTags> {
++    let last = batch.events.last()?;
++    let parsed = crate::queue::parse_thread_tags(&last.event);
++    let parent = last.event.id.to_hex();
++    let root = parsed.root_event_id.unwrap_or_else(|| parent.clone());
++    Some(ThreadTags {
++        root_event_id: Some(root),
++        parent_event_id: Some(parent),
++        mentioned_pubkeys: Vec::new(),
++    })
++}
++
++fn normalize_reply_name(name: &str) -> Option<String> {
++    let normalized = name.trim().trim_start_matches('@').to_ascii_lowercase();
++    if normalized.is_empty() {
++        None
++    } else {
++        Some(normalized)
++    }
++}
++
++fn resolve_reply_mentions(
++    content: &str,
++    profiles: Option<&PromptProfileLookup>,
++    sender_pubkey: &str,
++) -> Vec<String> {
++    let Some(profiles) = profiles else {
++        return Vec::new();
++    };
++
++    let mut known_names = Vec::new();
++    let mut name_to_pubkeys: HashMap<String, Vec<String>> = HashMap::new();
++    for (pubkey, profile) in profiles {
++        for name in [
++            profile.display_name.as_deref(),
++            profile.nip05_handle.as_deref(),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            if let Some(normalized) = normalize_reply_name(name) {
++                if !known_names.contains(&normalized) {
++                    known_names.push(normalized.clone());
++                }
++                let pubkeys = name_to_pubkeys.entry(normalized).or_default();
++                if !pubkeys.contains(pubkey) {
++                    pubkeys.push(pubkey.clone());
++                }
++            }
++        }
++    }
++
++    let known_refs: Vec<&str> = known_names.iter().map(String::as_str).collect();
++    let mut resolved = Vec::new();
++    for name in buzz_sdk::mentions::extract_at_mentions_with_known(content, &known_refs) {
++        if let Some(candidates) = name_to_pubkeys.get(&name) {
++            if candidates.len() == 1 {
++                resolved.push(candidates[0].clone());
++            }
++        }
++    }
++    buzz_sdk::mentions::normalize_mention_pubkeys(&resolved, Some(sender_pubkey))
++}
++
++async fn post_agent_reply(
++    rest: &crate::relay::RestClient,
++    channel_id: Uuid,
++    batch: &FlushBatch,
++    content: &str,
++    mentions: &[String],
++) {
++    let Some(thread_tags) = reply_thread_tags_for_batch(batch) else {
++        return;
++    };
++    post_visible_message(rest, channel_id, &thread_tags, content, mentions).await;
++}
++
++/// Best-effort: post a visible failure notice after a batch is dead-lettered.
++pub(crate) async fn post_failure_notice(
++    rest: &crate::relay::RestClient,
++    channel_id: Uuid,
++    thread_tags: &ThreadTags,
++    content: &str,
++) {
++    post_system_notice(rest, channel_id, thread_tags, content).await;
++}
++
+ /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
+ ///
+ /// Queries kind:7 reactions by our pubkey targeting the event, finds the matching
+@@ -7577,6 +7777,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             heartbeat_prompt: None,
+             base_prompt: None,
+             cwd: ".".to_string(),
++            additional_directories: Vec::new(),
+             rest_client: RestClient {
+                 http: reqwest::Client::new(),
+                 base_url: "http://127.0.0.1:0".to_string(),
+@@ -7594,7 +7795,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             ),
+             context_message_limit: 0,
+             max_turns_per_session: 0,
+-            permission_mode: PermissionMode::Default,
++            permission_mode: PermissionMode::Plan,
++            session_overrides: Arc::new(Mutex::new(HashMap::new())),
+             agent_keys: agent_keys.clone(),
+             agent_owner_pubkey: owner_pubkey,
+             memory_enabled: false,
+diff --git a/crates/buzz-acp/src/queue.rs b/crates/buzz-acp/src/queue.rs
+index b0f0fa248..e456eebc8 100644
+--- a/crates/buzz-acp/src/queue.rs
++++ b/crates/buzz-acp/src/queue.rs
+@@ -13,7 +13,7 @@
+ //!   still queue normally.
+ //! - **Queue** — all events accumulate; batched on the next flush cycle.
+ 
+-use nostr::{Event, ToBech32};
++use nostr::Event;
+ use std::collections::{HashMap, HashSet, VecDeque};
+ use std::time::{Duration, Instant};
+ use uuid::Uuid;
+@@ -1027,6 +1027,7 @@ pub struct ContextMessage {
+     /// empty and cannot participate in delivery deduplication.
+     pub event_id: String,
+     pub pubkey: String,
++    #[allow(dead_code)]
+     pub timestamp: String,
+     pub content: String,
+ }
+@@ -1100,169 +1101,39 @@ fn resolve_prompt_label(
+         })
+ }
+ 
+-fn format_prompt_actor(pubkey: &str, profile_lookup: Option<&PromptProfileLookup>) -> String {
++fn short_pubkey(pubkey: &str) -> String {
++    let trimmed = pubkey.trim();
++    if trimmed.len() > 12 {
++        format!("{}...{}", &trimmed[..8], &trimmed[trimmed.len() - 4..])
++    } else {
++        trimmed.to_string()
++    }
++}
++
++fn format_message_sender(pubkey: &str, profile_lookup: Option<&PromptProfileLookup>) -> String {
+     match resolve_prompt_label(pubkey, profile_lookup) {
+-        Some(label) => format!("{label} ({pubkey})"),
+-        None => pubkey.to_string(),
++        Some(label) => format!("{label} ({})", short_pubkey(pubkey)),
++        None => short_pubkey(pubkey),
+     }
+ }
+ 
+-/// Format the per-event `[Event]` block for a single [`BatchEvent`].
+-///
+-/// Includes: event_id, channel (name + UUID), kind, sender (hex + npub),
+-/// time, content, all tags (never stripped), and parsed structural fields.
++/// Format the per-message block for a single [`BatchEvent`].
+ ///
+ /// Reused by the goose-native steer path (lib.rs mode-gate) to render the
+ /// single withheld event for delivery via `_goose/unstable/session/steer`,
+ /// without paying for the batch-level context blocks the in-flight turn
+ /// already has.
+ pub(crate) fn format_event_block(
+-    channel_id: Uuid,
+-    channel_info: Option<&PromptChannelInfo>,
++    _channel_id: Uuid,
++    _channel_info: Option<&PromptChannelInfo>,
+     be: &BatchEvent,
+     profile_lookup: Option<&PromptProfileLookup>,
+ ) -> String {
+     let hex = be.event.pubkey.to_hex();
+-    let npub = be.event.pubkey.to_bech32().unwrap_or_else(|_| hex.clone());
+-
+-    let time = chrono::DateTime::from_timestamp(be.event.created_at.as_secs() as i64, 0)
+-        .map(|dt| dt.to_rfc3339())
+-        .unwrap_or_else(|| be.event.created_at.as_secs().to_string());
+-
+-    let kind = be.event.kind.as_u16() as u32;
+-    let event_id = be.event.id.to_hex();
+-
+-    let channel_display = match channel_info {
+-        Some(ci) => format!("{} (#{channel_id})", ci.name),
+-        None => channel_id.to_string(),
+-    };
+-
+-    let mut block = format!(
+-        "Event ID: {event_id}\n\
+-         Channel: {channel_display}\n\
+-         Kind: {kind}\n\
+-         From: {}\n\
+-         Time: {time}\n\
+-         Content: {}",
+-        match resolve_prompt_label(&hex, profile_lookup) {
+-            Some(label) => format!("{label} (npub: {npub}, hex: {hex})"),
+-            None => format!("{npub} (hex: {hex})"),
+-        },
+-        be.event.content,
+-    );
+-
+-    // Always include tags — they carry structural information.
+-    let tags_json: Vec<&[String]> = be.event.tags.iter().map(|t| t.as_slice()).collect();
+-    if let Ok(tags_str) = serde_json::to_string(&tags_json) {
+-        block.push_str(&format!("\nTags: {tags_str}"));
+-    }
+-
+-    // Parsed structural fields.
+-    let thread = parse_thread_tags(&be.event);
+-    let mut parsed_parts = Vec::new();
+-    if let Some(ref p) = thread.parent_event_id {
+-        parsed_parts.push(format!("parent={p}"));
+-    }
+-    if let Some(ref r) = thread.root_event_id {
+-        parsed_parts.push(format!("root={r}"));
+-    }
+-    if !thread.mentioned_pubkeys.is_empty() {
+-        parsed_parts.push(format!(
+-            "mentions=[{}]",
+-            thread
+-                .mentioned_pubkeys
+-                .iter()
+-                .map(|pubkey| format_prompt_actor(pubkey, profile_lookup))
+-                .collect::<Vec<_>>()
+-                .join(", ")
+-        ));
+-    }
+-    if !parsed_parts.is_empty() {
+-        block.push_str(&format!("\nParsed: {}", parsed_parts.join(", ")));
+-    }
+-
+-    block
+-}
+-
+-/// Append a reply instruction when the agent is responding to a thread event.
+-///
+-/// Tells the agent to default to `--reply-to <event_id>` for ordinary replies
+-/// while still allowing an explicit human request to post at the channel root or
+-/// top level.
+-fn append_reply_instruction(s: &mut String, event_id: &str) {
+-    s.push_str(&format!(
+-        "\nIMPORTANT: For ordinary replies in this turn, use `--reply-to {event_id}` \
+-         on `buzz messages send` so the conversation stays threaded. \
+-         If the human explicitly asks for a channel-root, top-level, \
+-         or broadcast post, send that message without `--reply-to`. \
+-         If the requested destination is ambiguous, ask before sending."
+-    ));
+-}
+-
+-/// Append a new-thread reply instruction for a human-facing top-level mention.
+-///
+-/// The triggering mention has no thread tags, so the agent's reply becomes the
+-/// thread root. Anchoring to the triggering event (rather than leaving the
+-/// choice open) prevents replying into a stale/unrelated prior thread.
+-fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
+-    s.push_str(&format!(
+-        "\nIMPORTANT: This is a new top-level message. For ordinary replies in \
+-         this turn, use `--reply-to {event_id}` on `buzz messages send` — the \
+-         triggering message is the thread root. Do NOT reply into any other \
+-         (older) thread. If the human explicitly asks for a channel-root, \
+-         top-level, or broadcast post, send that message without `--reply-to`."
+-    ));
+-}
+-
+-/// Decide whether a turn is human-facing for reply-anchor purposes.
+-///
+-/// A turn is human-facing when the triggering sender is a human, OR a human
+-/// (other than this agent) is tagged in the triggering event. Identity comes
+-/// from `PromptProfile::is_agent` (NIP-OA auth tag), not raw `p`-tag presence:
+-/// agent-only mentions must not force flattening. When a participant cannot be
+-/// classified (no profile fetched), it is treated as human — humans must not
+-/// lose thread visibility to a misclassification.
+-fn turn_is_human_facing(
+-    sender_pubkey: &str,
+-    thread_tags: &ThreadTags,
+-    profile_lookup: Option<&PromptProfileLookup>,
+-) -> bool {
+-    let is_agent = |pubkey: &str| -> bool {
+-        profile_lookup
+-            .and_then(|m| m.get(&normalize_lookup_key(pubkey)))
+-            .map(|p| p.is_agent)
+-            // Unknown identity → treat as human (fail open for visibility).
+-            .unwrap_or(false)
+-    };
+-
+-    if !is_agent(sender_pubkey) {
+-        return true;
+-    }
+-    thread_tags.mentioned_pubkeys.iter().any(|pk| !is_agent(pk))
+-}
+-
+-/// Resolve the `--reply-to` anchor for a non-DM turn.
+-///
+-/// Returns `Some(id)` only for human-facing turns (see [`turn_is_human_facing`]):
+-///   - in a thread → the thread ROOT, keeping the reply flat at layer 1
+-///   - top-level   → the triggering event id, which becomes the new thread root
+-///
+-/// Returns `None` for agent↔agent turns, leaving the agent free to nest deeply
+-/// (intentional for agent coordination).
+-fn resolve_reply_anchor(
+-    sender_pubkey: &str,
+-    thread_tags: &ThreadTags,
+-    triggering_event_id: &str,
+-    profile_lookup: Option<&PromptProfileLookup>,
+-) -> Option<String> {
+-    if !turn_is_human_facing(sender_pubkey, thread_tags, profile_lookup) {
+-        return None;
+-    }
+-    Some(
+-        thread_tags
+-            .root_event_id
+-            .clone()
+-            .unwrap_or_else(|| triggering_event_id.to_string()),
++    format!(
++        "From: {}\nContent:\n{}",
++        format_message_sender(&hex, profile_lookup),
++        be.event.content
+     )
+ }
+ 
+@@ -1309,12 +1180,6 @@ fn append_channel_description(s: &mut String, channel_info: Option<&PromptChanne
+ }
+ 
+ /// Format a `[Context]` hints section based on event scope.
+-///
+-/// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
+-/// [`resolve_reply_anchor`]). In the thread/DM branches it threads ordinary
+-/// replies; in the channel branch a `Some` anchor means a human-facing
+-/// top-level mention whose reply should open a new thread rooted at the
+-/// triggering event.
+ fn format_context_hints(
+     channel_id: Uuid,
+     channel_info: Option<&PromptChannelInfo>,
+@@ -1322,10 +1187,10 @@ fn format_context_hints(
+     is_dm: bool,
+     has_conversation_context: bool,
+     conversation_context_had_delivered_events: bool,
+-    reply_anchor: Option<&str>,
++    _reply_anchor: Option<&str>,
+ ) -> String {
+     let channel_display = match channel_info {
+-        Some(ci) => format!("{} (#{channel_id})", ci.name),
++        Some(ci) => ci.name.clone(),
+         None => channel_id.to_string(),
+     };
+ 
+@@ -1333,20 +1198,18 @@ fn format_context_hints(
+     // and the scope should be "dm" (not "thread") because the agent is in a DM.
+     if is_dm {
+         let is_reply = thread_tags.root_event_id.is_some();
+-        // DM replies use thread command because /messages excludes thread replies.
+-        // DM non-replies use get for recent conversation.
+         let ctx_hint = if has_conversation_context && is_reply {
+-            "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
++            "Thread context included below."
+         } else if has_conversation_context {
+-            "Conversation context included below. Use `buzz messages get --channel <UUID>` for full history if truncated."
++            "Conversation context included below."
+         } else if conversation_context_had_delivered_events && is_reply {
+-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
++            "Earlier thread context was already delivered in this session."
+         } else if conversation_context_had_delivered_events {
+-            "Earlier conversation context was already delivered in this session. Use `buzz messages get --channel <UUID>` to re-read it."
++            "Earlier conversation context was already delivered in this session."
+         } else if is_reply {
+-            "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch the reply chain."
++            "This is a direct-message reply."
+         } else {
+-            "Use `buzz messages get --channel <UUID>` for conversation context."
++            "This is a direct message."
+         };
+         let mut s = format!(
+             "[Context]\n\
+@@ -1354,43 +1217,23 @@ fn format_context_hints(
+              Channel: {channel_display}\n\
+              {ctx_hint}"
+         );
+-        // If this is a DM reply, include thread structural info as supplementary.
+-        if let Some(ref root) = thread_tags.root_event_id {
+-            s.push_str(&format!("\nThread root: {root}"));
+-            if let Some(ref parent) = thread_tags.parent_event_id {
+-                if parent != root {
+-                    s.push_str(&format!("\nParent: {parent}"));
+-                }
+-            }
+-            if let Some(event_id) = reply_anchor {
+-                append_reply_instruction(&mut s, event_id);
+-            }
+-        }
++        append_channel_description(&mut s, channel_info);
+         s
+-    } else if let Some(ref root) = thread_tags.root_event_id {
++    } else if thread_tags.root_event_id.is_some() {
+         let ctx_hint = if has_conversation_context {
+-            "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
++            "Thread context included below."
+         } else if conversation_context_had_delivered_events {
+-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
++            "Earlier thread context was already delivered in this session."
+         } else {
+-            "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context."
++            "This message is part of a thread."
+         };
+         let mut s = format!(
+             "[Context]\n\
+              Scope: thread\n\
+-             Channel: {channel_display}"
++             Channel: {channel_display}\n\
++             {ctx_hint}"
+         );
+         append_channel_description(&mut s, channel_info);
+-        s.push_str(&format!("\nThread root: {root}"));
+-        if let Some(ref parent) = thread_tags.parent_event_id {
+-            if parent != root {
+-                s.push_str(&format!("\nParent: {parent}"));
+-            }
+-        }
+-        s.push_str(&format!("\n{ctx_hint}"));
+-        if let Some(event_id) = reply_anchor {
+-            append_reply_instruction(&mut s, event_id);
+-        }
+         s
+     } else {
+         let mut s = format!(
+@@ -1399,12 +1242,6 @@ fn format_context_hints(
+              Channel: {channel_display}"
+         );
+         append_channel_description(&mut s, channel_info);
+-        s.push_str(
+-            "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
+-        );
+-        if let Some(event_id) = reply_anchor {
+-            append_new_thread_reply_instruction(&mut s, event_id);
+-        }
+         s
+     }
+ }
+@@ -1434,10 +1271,9 @@ fn format_conversation_context(
+     );
+     for (i, msg) in messages.iter().enumerate() {
+         s.push_str(&format!(
+-            "\n[{}] {} ({}): {}",
++            "\n[{}]\nFrom: {}\nContent:\n{}",
+             i + 1,
+-            format_prompt_actor(&msg.pubkey, profile_lookup),
+-            msg.timestamp,
++            format_message_sender(&msg.pubkey, profile_lookup),
+             msg.content,
+         ));
+     }
+@@ -1604,27 +1440,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
+         );
+     }
+ 
+-    // 2. Context hints (with a human-aware reply anchor).
+-    //
+-    // Human-facing turns are anchored so replies stay readable at layer 1:
+-    //   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
+-    //   - top-level     → anchor to the triggering event (it becomes the root)
+-    // Agent↔agent turns get no forced anchor — deep nesting is intentional
+-    // there. DMs are always 1:1 with a human, so they always anchor.
+-    let sender_pubkey = last_event.event.pubkey.to_hex();
+-    let reply_anchor = if is_dm {
+-        thread_tags
+-            .root_event_id
+-            .is_some()
+-            .then(|| last_event.event.id.to_hex())
+-    } else {
+-        resolve_reply_anchor(
+-            &sender_pubkey,
+-            &thread_tags,
+-            &last_event.event.id.to_hex(),
+-            args.profile_lookup,
+-        )
+-    };
++    // 2. Human-readable context hints. Reply anchoring is handled by the
++    // adapter; child agents should not see Buzz CLI instructions.
+     sections.push(format_context_hints(
+         batch.channel_id,
+         args.channel_info,
+@@ -1632,7 +1449,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
+         is_dm,
+         args.conversation_context.is_some(),
+         args.conversation_context_had_delivered_events,
+-        reply_anchor.as_deref(),
++        None,
+     ));
+ 
+     // 3. Conversation context (thread or DM).
+@@ -1654,7 +1471,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
+         let mut s = framing.prior_header.to_string();
+         for (i, be) in batch.cancelled_events.iter().enumerate() {
+             s.push_str(&format!(
+-                "\n\n--- Event {} ({}) ---\n{}",
++                "\n\n--- Message {} ({}) ---\n{}",
+                 i + 1,
+                 be.prompt_tag,
+                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+@@ -1668,32 +1485,31 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
+         let be = &batch.events[0];
+         if has_cancelled {
+             format!(
+-                "{}\n\n--- Event 1 ({}) ---\n{}",
++                "{}\n\n--- Message 1 ({}) ---\n{}",
+                 framing.new_header_single,
+                 be.prompt_tag,
+                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+             )
+         } else {
+             format!(
+-                "[Buzz event: {}]\n{}",
+-                be.prompt_tag,
++                "[Message]\n{}",
+                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+             )
+         }
+     } else {
+         let header = if has_cancelled {
+             format!(
+-                "{} — {} events]",
++                "{} — {} messages]",
+                 framing.new_header_multi_prefix,
+                 batch.events.len()
+             )
+         } else {
+-            format!("[Buzz events — {} events]", batch.events.len())
++            format!("[Messages — {} messages]", batch.events.len())
+         };
+         let mut s = header;
+         for (i, be) in batch.events.iter().enumerate() {
+             s.push_str(&format!(
+-                "\n\n--- Event {} ({}) ---\n{}",
++                "\n\n--- Message {} ({}) ---\n{}",
+                 i + 1,
+                 be.prompt_tag,
+                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+@@ -1944,13 +1760,10 @@ mod tests {
+         assert_eq!(batch.events[0].event.content, "oldest");
+         assert_eq!(batch.events[1].event.content, "newest");
+ 
+-        // The rendered prompt's reply anchor must cite the newest event, so
+-        // the agent's reply threads under the message it is responding to.
+-        let newest_id = batch.events[1].event.id.to_hex();
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {newest_id}")),
+-            "reply anchor must target the newest event; prompt was:\n{prompt}"
++            !prompt.contains("--reply-to"),
++            "agent prompts should not include Buzz CLI reply hints:\n{prompt}"
+         );
+     }
+ 
+@@ -2009,10 +1822,8 @@ mod tests {
+     fn test_format_prompt_single() {
+         let ch = Uuid::new_v4();
+         let event = make_event("Hello @agent");
+-        let npub = event
+-            .pubkey
+-            .to_bech32()
+-            .unwrap_or_else(|_| event.pubkey.to_hex());
++        let hex = event.pubkey.to_hex();
++        let short_hex = format!("{}...{}", &hex[..8], &hex[hex.len() - 4..]);
+ 
+         let batch = FlushBatch {
+             channel_id: ch,
+@@ -2030,14 +1841,15 @@ mod tests {
+         // Should contain [Context] section before the event.
+         assert!(prompt.contains("[Context]"));
+         assert!(prompt.contains("Scope: channel"));
+-        assert!(prompt.contains("[Buzz event: @mention]\n"));
++        assert!(prompt.contains("[Message]\n"));
+         assert!(prompt.contains(&format!("Channel: {}", ch)));
+-        assert!(prompt.contains(&format!("From: {}", npub)));
+-        assert!(prompt.contains("Content: Hello @agent"));
+-        // Event ID should be present.
+-        assert!(prompt.contains("Event ID:"));
+-        // Should NOT contain "--- Event 1 ---" (that's the multi-event format).
+-        assert!(!prompt.contains("--- Event 1 ---"));
++        assert!(prompt.contains(&format!("From: {}", short_hex)));
++        assert!(prompt.contains("Content:\nHello @agent"));
++        assert!(!prompt.contains("Event ID:"));
++        assert!(!prompt.contains("Kind:"));
++        assert!(!prompt.contains("Tags:"));
++        assert!(!prompt.contains("Trigger:"));
++        assert!(!prompt.contains("--- Message 1 ---"));
+     }
+ 
+     /// Helper: build a merged (cancel + re-prompt) batch with one cancelled
+@@ -2197,7 +2009,7 @@ mod tests {
+             cancel_reason: Some(CancelReason::Steer),
+         };
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+-        assert!(prompt.contains("New messages — arrived while you were working — 2 events]"));
++        assert!(prompt.contains("New messages — arrived while you were working — 2 messages]"));
+         assert!(!prompt.contains("supersedes"));
+     }
+ 
+@@ -2249,17 +2061,17 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+ 
+-        // Reply instruction points at the thread root of the steering message
+-        // (thread_b), not the steering event's own id — this matches the
+-        // human-aware reply anchoring from PR #1281: for human-facing turns in
+-        // a thread, the anchor is always the thread root.
+         assert!(
+-            prompt.contains(&format!("--reply-to {thread_b}")),
+-            "reply instruction should target the steering thread root: {prompt}"
++            !prompt.contains("--reply-to"),
++            "steered prompts should not include Buzz CLI reply hints: {prompt}"
++        );
++        assert!(
++            !prompt.contains(&thread_b),
++            "steered prompts should not expose thread ids: {prompt}"
+         );
+         assert!(
+-            !prompt.contains(&format!("--reply-to {thread_a}")),
+-            "reply instruction must NOT target the original thread: {prompt}"
++            !prompt.contains(&thread_a),
++            "steered prompts should not expose prior thread ids: {prompt}"
+         );
+         // Steer framing still frames the original as in-progress work to continue.
+         assert!(prompt.contains("[What you were working on]"));
+@@ -2429,13 +2241,13 @@ mod tests {
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+ 
+         assert!(prompt.contains("[Context]"));
+-        assert!(prompt.contains("[Buzz events — 3 events]"));
+-        assert!(prompt.contains("--- Event 1 (tag-a) ---"));
+-        assert!(prompt.contains("--- Event 2 (tag-b) ---"));
+-        assert!(prompt.contains("--- Event 3 (tag-c) ---"));
+-        assert!(prompt.contains("Content: first message"));
+-        assert!(prompt.contains("Content: second message"));
+-        assert!(prompt.contains("Content: third message"));
++        assert!(prompt.contains("[Messages — 3 messages]"));
++        assert!(prompt.contains("--- Message 1 (tag-a) ---"));
++        assert!(prompt.contains("--- Message 2 (tag-b) ---"));
++        assert!(prompt.contains("--- Message 3 (tag-c) ---"));
++        assert!(prompt.contains("Content:\nfirst message"));
++        assert!(prompt.contains("Content:\nsecond message"));
++        assert!(prompt.contains("Content:\nthird message"));
+     }
+ 
+     #[test]
+@@ -3270,7 +3082,8 @@ mod tests {
+             },
+         )
+         .join("\n\n");
+-        assert!(prompt.contains("engineering (#"));
++        assert!(prompt.contains("Channel: engineering"));
++        assert!(!prompt.contains("engineering (#"));
+         assert!(prompt.contains("Scope: channel"));
+     }
+ 
+@@ -3330,7 +3143,8 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(prompt.contains("Scope: thread"));
+-        assert!(prompt.contains("Thread root: root123"));
++        assert!(prompt.contains("This message is part of a thread."));
++        assert!(!prompt.contains("Thread root: root123"));
+     }
+ 
+     #[test]
+@@ -3491,11 +3305,12 @@ mod tests {
+         )
+         .join("\n\n");
+ 
+-        assert!(prompt.contains("From: Wes (npub:"));
+-        assert!(prompt.contains(
+-            "mentions=[Rick (aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)]"
+-        ));
+-        assert!(prompt.contains("[1] Wes ("));
++        let short_author = format!("{}...{}", &author_hex[..8], &author_hex[author_hex.len() - 4..]);
++        assert!(prompt.contains(&format!("From: Wes ({short_author})")));
++        assert!(prompt.contains("[1]\nFrom: Wes ("));
++        assert!(!prompt.contains("mentions=["));
++        assert!(!prompt.contains("npub:"));
++        assert!(!prompt.contains("hex:"));
+     }
+ 
+     #[test]
+@@ -3532,94 +3347,6 @@ mod tests {
+         );
+     }
+ 
+-    // ── Human-aware reply anchoring ──────────────────────────────────────────
+-
+-    const HUMAN_PK: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+-    const AGENT_A_PK: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+-    const AGENT_B_PK: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+-    const ROOT_ID: &str = "abc0000000000000000000000000000000000000000000000000000000000000";
+-    const TRIGGER_ID: &str = "def0000000000000000000000000000000000000000000000000000000000000";
+-
+-    fn profile(is_agent: bool) -> PromptProfile {
+-        PromptProfile {
+-            is_agent,
+-            ..Default::default()
+-        }
+-    }
+-
+-    /// Lookup with HUMAN as a human and AGENT_A / AGENT_B as agents.
+-    fn id_lookup() -> PromptProfileLookup {
+-        HashMap::from([
+-            (HUMAN_PK.to_string(), profile(false)),
+-            (AGENT_A_PK.to_string(), profile(true)),
+-            (AGENT_B_PK.to_string(), profile(true)),
+-        ])
+-    }
+-
+-    fn thread_tags(root: Option<&str>, mentions: &[&str]) -> ThreadTags {
+-        ThreadTags {
+-            root_event_id: root.map(str::to_string),
+-            parent_event_id: root.map(str::to_string),
+-            mentioned_pubkeys: mentions.iter().map(|s| s.to_string()).collect(),
+-        }
+-    }
+-
+-    #[test]
+-    fn test_anchor_human_in_thread_uses_root() {
+-        // Human asks inside a thread → anchor to the thread ROOT (flat at L1).
+-        let tags = thread_tags(Some(ROOT_ID), &[AGENT_A_PK]);
+-        let anchor = resolve_reply_anchor(HUMAN_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor.as_deref(), Some(ROOT_ID));
+-    }
+-
+-    #[test]
+-    fn test_anchor_human_top_level_uses_triggering_event() {
+-        // Human top-level mention (no thread tags) → triggering event is root.
+-        let tags = thread_tags(None, &[AGENT_A_PK]);
+-        let anchor = resolve_reply_anchor(HUMAN_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor.as_deref(), Some(TRIGGER_ID));
+-    }
+-
+-    #[test]
+-    fn test_anchor_agent_to_agent_in_thread_is_none() {
+-        // Agent pings agent inside a thread → no forced anchor (deep nesting ok).
+-        let tags = thread_tags(Some(ROOT_ID), &[AGENT_B_PK]);
+-        let anchor = resolve_reply_anchor(AGENT_A_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor, None);
+-    }
+-
+-    #[test]
+-    fn test_anchor_agent_to_agent_top_level_is_none() {
+-        let tags = thread_tags(None, &[AGENT_B_PK]);
+-        let anchor = resolve_reply_anchor(AGENT_A_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor, None);
+-    }
+-
+-    #[test]
+-    fn test_anchor_agent_sender_but_human_tagged_flattens() {
+-        // Agent-authored, but a human is tagged → human-facing → anchor to root.
+-        let tags = thread_tags(Some(ROOT_ID), &[AGENT_B_PK, HUMAN_PK]);
+-        let anchor = resolve_reply_anchor(AGENT_A_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor.as_deref(), Some(ROOT_ID));
+-    }
+-
+-    #[test]
+-    fn test_anchor_unknown_identity_treated_as_human() {
+-        // No profile lookup → fail open (treat as human so visibility is kept).
+-        let tags = thread_tags(Some(ROOT_ID), &[]);
+-        let anchor = resolve_reply_anchor(AGENT_A_PK, &tags, TRIGGER_ID, None);
+-        assert_eq!(anchor.as_deref(), Some(ROOT_ID));
+-    }
+-
+-    #[test]
+-    fn test_anchor_agent_only_p_tags_do_not_flatten() {
+-        // Raw p-tag presence must NOT flatten when every tagged pubkey is an
+-        // agent — this is the regression Pinky flagged.
+-        let tags = thread_tags(Some(ROOT_ID), &[AGENT_A_PK, AGENT_B_PK]);
+-        let anchor = resolve_reply_anchor(AGENT_A_PK, &tags, TRIGGER_ID, Some(&id_lookup()));
+-        assert_eq!(anchor, None);
+-    }
+-
+     #[test]
+     fn test_sanitize_prompt_label_strips_newlines_and_control_chars() {
+         assert_eq!(
+@@ -3638,7 +3365,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_format_prompt_dm_reply_hints_get_thread() {
++    fn test_format_prompt_dm_reply_uses_plain_context_hint() {
+         let ch = Uuid::new_v4();
+         // DM reply event — has thread e-tags.
+         let event = make_event_with_tags(
+@@ -3691,16 +3418,15 @@ mod tests {
+             prompt.contains("Scope: dm"),
+             "DM reply should have Scope: dm, got:\n{prompt}"
+         );
+-        // Hint should point to the thread command, not get.
+         assert!(
+-            prompt.contains("buzz messages thread"),
+-            "DM reply hint should mention `buzz messages thread`, got:\n{prompt}"
++            prompt.contains("Thread context included below."),
++            "DM reply should mention included thread context, got:\n{prompt}"
+         );
+-        // Thread structural info should be present.
+         assert!(
+-            prompt.contains("Thread root: root123"),
+-            "DM reply should include thread root"
++            !prompt.contains("buzz messages"),
++            "DM reply prompt should not include Buzz CLI hints"
+         );
++        assert!(!prompt.contains("Thread root:"));
+         // Thread context should be included.
+         assert!(prompt.contains("Should I deploy?"));
+     }
+@@ -3742,7 +3468,7 @@ mod tests {
+         .join("\n\n");
+ 
+         assert!(prompt.contains("Earlier thread context was already delivered in this session"));
+-        assert!(prompt.contains("buzz messages thread"));
++        assert!(!prompt.contains("buzz messages"));
+         assert!(!prompt.contains("Thread context included below"));
+         assert!(!prompt.contains("[Thread Context"));
+     }
+@@ -3790,13 +3516,13 @@ mod tests {
+         assert!(
+             prompt.contains("Earlier conversation context was already delivered in this session")
+         );
+-        assert!(prompt.contains("buzz messages get"));
++        assert!(!prompt.contains("buzz messages"));
+         assert!(!prompt.contains("Conversation context included below"));
+         assert!(!prompt.contains("[Conversation Context"));
+     }
+ 
+     #[test]
+-    fn test_format_prompt_dm_non_reply_hints_get_messages() {
++    fn test_format_prompt_dm_non_reply_uses_plain_context_hint() {
+         let ch = Uuid::new_v4();
+         let event = make_event("hey there");
+         let batch = FlushBatch {
+@@ -3826,17 +3552,17 @@ mod tests {
+         .join("\n\n");
+         assert!(prompt.contains("Scope: dm"));
+         assert!(
+-            prompt.contains("buzz messages get"),
+-            "DM non-reply hint should mention `buzz messages get`"
++            prompt.contains("This is a direct message."),
++            "DM non-reply prompt should describe the scope"
+         );
+         assert!(
+-            !prompt.contains("buzz messages thread"),
+-            "DM non-reply should NOT mention `buzz messages thread`"
++            !prompt.contains("buzz messages"),
++            "DM non-reply prompt should not include Buzz CLI hints"
+         );
+     }
+ 
+     #[test]
+-    fn test_format_event_block_includes_event_id() {
++    fn test_format_event_block_omits_event_id() {
+         let ch = Uuid::new_v4();
+         let event = make_event("test");
+         let event_id = event.id.to_hex();
+@@ -3853,17 +3579,17 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("Event ID: {event_id}")),
+-            "prompt should contain the event ID"
++            !prompt.contains(&format!("Event ID: {event_id}")),
++            "prompt should not contain the event ID"
+         );
+     }
+ 
+     #[test]
+-    fn test_format_event_block_includes_hex_and_npub() {
++    fn test_format_event_block_uses_short_sender_id() {
+         let ch = Uuid::new_v4();
+         let event = make_event("test");
+         let hex = event.pubkey.to_hex();
+-        let npub = event.pubkey.to_bech32().unwrap();
++        let short_hex = format!("{}...{}", &hex[..8], &hex[hex.len() - 4..]);
+         let batch = FlushBatch {
+             channel_id: ch,
+             events: vec![BatchEvent {
+@@ -3877,13 +3603,15 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("From: {npub} (hex: {hex})")),
+-            "prompt should contain both npub and hex"
++            prompt.contains(&format!("From: {short_hex}")),
++            "prompt should contain a shortened sender id"
+         );
++        assert!(!prompt.contains(&hex));
++        assert!(!prompt.contains("npub"));
+     }
+ 
+     #[test]
+-    fn test_format_event_block_always_includes_tags() {
++    fn test_format_event_block_omits_raw_tags() {
+         let ch = Uuid::new_v4();
+         // Kind 9 (stream message) — tags were previously stripped.
+         let event = make_event_with_tags("hello", vec![vec!["h".into(), ch.to_string()]]);
+@@ -3900,8 +3628,8 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains("Tags:"),
+-            "tags should always be included, even for stream messages"
++            !prompt.contains("Tags:"),
++            "prompt should not include raw Buzz tags"
+         );
+     }
+ 
+@@ -4246,7 +3974,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_present_for_channel_thread_reply() {
++    fn test_prompt_omits_reply_instruction_for_channel_thread_reply() {
+         let ch = Uuid::new_v4();
+         let root_id = "a".repeat(64);
+         let event = make_event_with_tags(
+@@ -4264,37 +3992,29 @@ mod tests {
+             cancel_reason: None,
+         };
+ 
+-        // No profile lookup → sender treated as human → human-facing thread
+-        // reply anchors to the thread ROOT (flat at layer 1), not the
+-        // triggering event id.
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {root_id}")),
+-            "human-facing thread reply should anchor to the thread root"
+-        );
+-        assert!(
+-            prompt.contains("For ordinary replies in this turn"),
+-            "channel thread reply should describe reply-to as the default"
++            !prompt.contains("--reply-to"),
++            "prompt should not include Buzz CLI reply instructions"
+         );
+         assert!(
+-            prompt.contains("send that message without `--reply-to`"),
+-            "channel thread reply should allow explicit channel-root/top-level requests"
++            !prompt.contains(&root_id),
++            "prompt should not expose thread root ids"
+         );
+         assert!(
+-            !prompt.contains("Do not broadcast to the channel"),
+-            "reply instruction should not forbid explicit human-requested root posts"
++            prompt.contains("This message is part of a thread."),
++            "channel thread reply should keep a plain scope hint"
+         );
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_present_for_dm_thread_reply() {
++    fn test_prompt_omits_reply_instruction_for_dm_thread_reply() {
+         let ch = Uuid::new_v4();
+         let root_id = "b".repeat(64);
+         let event = make_event_with_tags(
+             "thanks",
+-            vec![vec!["e".into(), root_id, "".into(), "reply".into()]],
++            vec![vec!["e".into(), root_id.clone(), "".into(), "reply".into()]],
+         );
+-        let event_id = event.id.to_hex();
+         let batch = FlushBatch {
+             channel_id: ch,
+             events: vec![BatchEvent {
+@@ -4320,16 +4040,16 @@ mod tests {
+         )
+         .join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {event_id}")),
+-            "DM thread reply should include reply instruction"
++            !prompt.contains("--reply-to"),
++            "DM thread reply prompt should not include Buzz CLI reply instructions"
+         );
++        assert!(!prompt.contains(&root_id));
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_present_for_top_level_human_message() {
++    fn test_prompt_omits_reply_instruction_for_top_level_human_message() {
+         let ch = Uuid::new_v4();
+         let event = make_event("hello world");
+-        let event_id = event.id.to_hex();
+         let batch = FlushBatch {
+             channel_id: ch,
+             events: vec![BatchEvent {
+@@ -4341,17 +4061,14 @@ mod tests {
+             cancel_reason: None,
+         };
+ 
+-        // Top-level human message (no lookup → human): the reply opens a new
+-        // thread anchored to the triggering event, preventing replies into a
+-        // stale older thread.
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {event_id}")),
+-            "top-level human message should anchor a new thread at the triggering event"
++            !prompt.contains("--reply-to"),
++            "top-level prompt should not include Buzz CLI reply instructions"
+         );
+         assert!(
+-            prompt.contains("new top-level message"),
+-            "top-level human message should use the new-thread instruction"
++            !prompt.contains("new top-level message"),
++            "top-level prompt should not include old reply guidance"
+         );
+     }
+ 
+@@ -4401,7 +4118,6 @@ mod tests {
+                 vec!["e".into(), parent_id.clone(), "".into(), "reply".into()],
+             ],
+         );
+-        let event_id = event.id.to_hex();
+         let batch = FlushBatch {
+             channel_id: ch,
+             events: vec![BatchEvent {
+@@ -4413,25 +4129,19 @@ mod tests {
+             cancel_reason: None,
+         };
+ 
+-        // Human-facing (no lookup) deep reply: anchor to the thread ROOT to
+-        // keep the conversation flat — NOT the triggering event or parent.
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {root_id}")),
+-            "human-facing nested reply should anchor to the thread root"
+-        );
+-        assert!(
+-            !prompt.contains(&format!("--reply-to {event_id}")),
+-            "instruction should NOT anchor to the triggering event id"
++            !prompt.contains("--reply-to"),
++            "nested reply prompt should not include Buzz CLI reply instructions"
+         );
+         assert!(
+-            !prompt.contains(&format!("--reply-to {parent_id}")),
+-            "instruction should NOT anchor to the parent event id"
++            !prompt.contains(&root_id) && !prompt.contains(&parent_id),
++            "nested reply prompt should not expose raw thread ids"
+         );
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_allows_explicit_root_post_requests() {
++    fn test_prompt_omits_reply_instruction_for_explicit_root_post_requests() {
+         let ch = Uuid::new_v4();
+         let root_id = "e".repeat(64);
+         let event = make_event_with_tags(
+@@ -4451,21 +4161,21 @@ mod tests {
+ 
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {root_id}")),
+-            "human-facing thread reply should anchor to the thread root"
++            !prompt.contains("--reply-to"),
++            "prompt should not include Buzz CLI reply instructions"
+         );
+         assert!(
+-            prompt.contains("channel-root, top-level"),
+-            "instruction should tell agents to honor explicit root/top-level requests"
++            !prompt.contains(&root_id),
++            "prompt should not expose raw thread ids"
+         );
+         assert!(
+-            !prompt.contains("on EVERY `buzz messages send` call"),
+-            "instruction should not make reply-to absolute for every send"
++            !prompt.contains("on EVERY"),
++            "prompt should not include old reply-command wording"
+         );
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_batched_last_event_is_threaded() {
++    fn test_prompt_omits_reply_instruction_when_batched_last_event_is_threaded() {
+         let ch = Uuid::new_v4();
+         let plain = make_event("unrelated");
+         let root_id = "c".repeat(64);
+@@ -4491,17 +4201,16 @@ mod tests {
+             cancel_reason: None,
+         };
+ 
+-        // Scope derives from the last (threaded) event; human-facing → anchor
+-        // to that thread's root.
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {root_id}")),
+-            "batched prompt should anchor to the last (threaded) event's root"
++            !prompt.contains("--reply-to"),
++            "batched prompt should not include Buzz CLI reply instructions"
+         );
++        assert!(!prompt.contains(&root_id));
+     }
+ 
+     #[test]
+-    fn test_reply_instruction_batched_last_event_is_top_level() {
++    fn test_prompt_omits_reply_instruction_when_batched_last_event_is_top_level() {
+         let ch = Uuid::new_v4();
+         let root_id = "d".repeat(64);
+         let threaded = make_event_with_tags(
+@@ -4509,7 +4218,6 @@ mod tests {
+             vec![vec!["e".into(), root_id, "".into(), "reply".into()]],
+         );
+         let plain = make_event("latest top-level");
+-        let plain_id = plain.id.to_hex();
+         let batch = FlushBatch {
+             channel_id: ch,
+             events: vec![
+@@ -4528,16 +4236,14 @@ mod tests {
+             cancel_reason: None,
+         };
+ 
+-        // Last event is top-level and human-facing → opens a new thread
+-        // anchored to that top-level event (NOT the earlier thread's root).
+         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+         assert!(
+-            prompt.contains(&format!("--reply-to {plain_id}")),
+-            "batched top-level-last prompt should anchor to the last (top-level) event"
++            !prompt.contains("--reply-to"),
++            "batched prompt should not include Buzz CLI reply instructions"
+         );
+         assert!(
+-            prompt.contains("new top-level message"),
+-            "batched top-level-last prompt should use the new-thread instruction"
++            !prompt.contains("new top-level message"),
++            "batched prompt should not include old reply guidance"
+         );
+     }
+ 

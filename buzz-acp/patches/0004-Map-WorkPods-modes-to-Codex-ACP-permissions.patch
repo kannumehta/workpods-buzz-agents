@@ -1,0 +1,317 @@
+From d5cb8a6afd81ecb6a0ed17c6b244556483c9efd9 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Mon, 17 Aug 2026 04:31:48 +0000
+Subject: [PATCH 4/6] Map WorkPods modes to Codex ACP permissions
+
+---
+ crates/buzz-acp/src/acp.rs    | 141 ++++++++++++++++++++++++++--------
+ crates/buzz-acp/src/config.rs |  20 +++--
+ crates/buzz-acp/src/pool.rs   |  24 ++++++
+ 3 files changed, 148 insertions(+), 37 deletions(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index 21b6fc00f..927df8225 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
+ use tokio::process::{Child, ChildStdin, ChildStdout};
+ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
+ 
++use crate::config::PermissionMode;
+ use crate::observer::{ObserverContext, ObserverHandle};
+ use crate::usage::{
+     PromptResponseUsage, StandardAdapterKind, StandardUsageTracker, TurnUsage, UsageTracker,
+@@ -214,6 +215,8 @@ pub struct AcpClient {
+     standard_usage: StandardUsageTracker,
+     /// Known adapter identity for prompt-response usage mapping.
+     standard_adapter: Option<StandardAdapterKind>,
++    /// Public WorkPods permission mode for handling ACP permission requests.
++    permission_mode: PermissionMode,
+     /// Assistant text streamed during the current `session/prompt` turn.
+     last_assistant_text: String,
+ }
+@@ -585,6 +588,7 @@ impl AcpClient {
+             goose_usage: UsageTracker::default(),
+             standard_usage: StandardUsageTracker::default(),
+             standard_adapter,
++            permission_mode: PermissionMode::Plan,
+             last_assistant_text: String::new(),
+         })
+     }
+@@ -600,6 +604,11 @@ impl AcpClient {
+         self.observer_context = context;
+     }
+ 
++    /// Set the public WorkPods permission mode used for ACP permission requests.
++    pub fn set_permission_mode(&mut self, permission_mode: PermissionMode) {
++        self.permission_mode = permission_mode;
++    }
++
+     /// Return a clone of the observer handle, if attached.
+     pub(crate) fn observer_handle(&self) -> Option<ObserverHandle> {
+         self.observer.clone()
+@@ -2006,10 +2015,11 @@ impl AcpClient {
+         }
+     }
+ 
+-    /// Auto-approve a `session/request_permission` request from the agent.
++    /// Respond to a `session/request_permission` request from the agent.
+     ///
+-    /// Finds the option with `kind == "allow_once"` and responds with its `optionId`.
+-    /// If no `allow_once` option exists, falls back to `reject_once`.
++    /// `auto` chooses an allow-style option, `edit` only allows edit tool
++    /// requests, and `plan` rejects. This keeps non-interactive Buzz sessions
++    /// fail-closed unless the channel was explicitly switched to auto.
+     ///
+     /// **Critical:** Never hardcode `optionId` — always find it dynamically by `kind`.
+     ///
+@@ -2037,40 +2047,30 @@ impl AcpClient {
+             options.len()
+         );
+ 
+-        // Find allow_once by kind — NEVER hardcode optionId.
+-        let allow_once = options
+-            .iter()
+-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
++        let tool_kind = msg
++            .pointer("/params/toolCall/kind")
++            .and_then(|kind| kind.as_str());
++        let option_id = select_permission_option(options, self.permission_mode, tool_kind)
++            .ok_or_else(|| AcpError::Protocol("permission request has no selectable option".into()))?;
+ 
+-        let response = if let Some(opt) = allow_once {
+-            let option_id = opt["optionId"]
+-                .as_str()
+-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
++        if matches!(self.permission_mode, PermissionMode::Auto)
++            || (matches!(self.permission_mode, PermissionMode::Edit) && tool_kind == Some("edit"))
++        {
+             tracing::info!(
+                 target: "acp::permission",
+-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
++                mode = %self.permission_mode,
++                tool_kind = tool_kind.unwrap_or("unknown"),
++                "approving permission id={id} with optionId={option_id:?}"
+             );
+-            permission_response_selected(&id, option_id)
+         } else {
+-            // No allow_once — fall back to reject_once.
+-            tracing::warn!(
++            tracing::info!(
+                 target: "acp::permission",
+-                "no allow_once option found in permission request id={id}, falling back to reject_once"
++                mode = %self.permission_mode,
++                tool_kind = tool_kind.unwrap_or("unknown"),
++                "rejecting permission id={id} with optionId={option_id:?}"
+             );
+-            let reject = options
+-                .iter()
+-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
+-
+-            if let Some(opt) = reject {
+-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
+-                permission_response_selected(&id, option_id)
+-            } else {
+-                return Err(AcpError::Protocol(
+-                    "no suitable permission option found (neither allow_once nor reject_once)"
+-                        .into(),
+-                ));
+-            }
+-        };
++        }
++        let response = permission_response_selected(&id, option_id);
+ 
+         // Write the response first, then mark as responded.
+         //
+@@ -2204,6 +2204,35 @@ fn permission_response_cancelled(id: &serde_json::Value) -> serde_json::Value {
+     })
+ }
+ 
++fn select_permission_option<'a>(
++    options: &'a [serde_json::Value],
++    mode: PermissionMode,
++    tool_kind: Option<&str>,
++) -> Option<&'a str> {
++    let allow_kinds: &[&str] = match mode {
++        PermissionMode::Auto => &["allow_once", "allow_always"],
++        PermissionMode::Edit if tool_kind == Some("edit") => &["allow_once", "allow_always"],
++        PermissionMode::Edit | PermissionMode::Plan => &[],
++    };
++
++    for kind in allow_kinds {
++        if let Some(option_id) = option_id_for_kind(options, kind) {
++            return Some(option_id);
++        }
++    }
++
++    option_id_for_kind(options, "reject_once")
++        .or_else(|| option_id_for_kind(options, "reject_always"))
++}
++
++fn option_id_for_kind<'a>(options: &'a [serde_json::Value], kind: &str) -> Option<&'a str> {
++    options.iter().find_map(|opt| {
++        (opt.get("kind").and_then(|k| k.as_str()) == Some(kind))
++            .then(|| opt.get("optionId").and_then(|id| id.as_str()))
++            .flatten()
++    })
++}
++
+ /// Full `session/new` response — session ID plus the raw JSON result.
+ ///
+ /// Callers use the extractor helpers to pull model info from `raw`.
+@@ -2517,6 +2546,58 @@ mod tests {
+         assert_eq!(reject_once.unwrap()["optionId"].as_str(), Some("rej-x"));
+     }
+ 
++    #[test]
++    fn permission_selection_auto_allows_once() {
++        let options: Vec<serde_json::Value> = serde_json::from_str(
++            r#"[
++            {"optionId": "reject-1", "name": "Reject", "kind": "reject_once"},
++            {"optionId": "allow-1", "name": "Allow Once", "kind": "allow_once"}
++        ]"#,
++        )
++        .unwrap();
++
++        assert_eq!(
++            select_permission_option(&options, PermissionMode::Auto, Some("execute")),
++            Some("allow-1")
++        );
++    }
++
++    #[test]
++    fn permission_selection_plan_rejects() {
++        let options: Vec<serde_json::Value> = serde_json::from_str(
++            r#"[
++            {"optionId": "reject-1", "name": "Reject", "kind": "reject_once"},
++            {"optionId": "allow-1", "name": "Allow Once", "kind": "allow_once"}
++        ]"#,
++        )
++        .unwrap();
++
++        assert_eq!(
++            select_permission_option(&options, PermissionMode::Plan, Some("execute")),
++            Some("reject-1")
++        );
++    }
++
++    #[test]
++    fn permission_selection_edit_only_allows_edits() {
++        let options: Vec<serde_json::Value> = serde_json::from_str(
++            r#"[
++            {"optionId": "reject-1", "name": "Reject", "kind": "reject_once"},
++            {"optionId": "allow-1", "name": "Allow Once", "kind": "allow_once"}
++        ]"#,
++        )
++        .unwrap();
++
++        assert_eq!(
++            select_permission_option(&options, PermissionMode::Edit, Some("edit")),
++            Some("allow-1")
++        );
++        assert_eq!(
++            select_permission_option(&options, PermissionMode::Edit, Some("execute")),
++            Some("reject-1")
++        );
++    }
++
+     #[test]
+     fn request_has_id_field() {
+         let id: u64 = 42;
+diff --git a/crates/buzz-acp/src/config.rs b/crates/buzz-acp/src/config.rs
+index fced48af0..c5dfa7fc0 100644
+--- a/crates/buzz-acp/src/config.rs
++++ b/crates/buzz-acp/src/config.rs
+@@ -112,7 +112,7 @@ impl std::fmt::Display for RespondTo {
+ }
+ 
+ /// Permission mode for agents that support `session/set_config_option` with
+-/// `configId: "mode"` (e.g. `claude-agent-acp`).
++/// `configId: "mode"` (e.g. `claude-agent-acp`, `codex-acp`).
+ ///
+ /// - `plan` — planning-only mode (no tool execution).
+ /// - `auto` — execute without interactive approval when the adapter supports it.
+@@ -144,9 +144,9 @@ impl PermissionMode {
+     /// Return adapter-specific wire modes in preference order.
+     pub fn preferred_wire_modes(&self) -> &'static [&'static str] {
+         match self {
+-            Self::Plan => &["plan"],
+-            Self::Auto => &["bypassPermissions", "auto"],
+-            Self::Edit => &["acceptEdits"],
++            Self::Plan => &["plan", "read-only"],
++            Self::Auto => &["bypassPermissions", "auto", "agent-full-access"],
++            Self::Edit => &["acceptEdits", "agent"],
+         }
+     }
+ }
+@@ -2357,12 +2357,18 @@ channels = "ALL"
+ 
+     #[test]
+     fn test_permission_mode_adapter_mappings() {
+-        assert_eq!(PermissionMode::Plan.preferred_wire_modes(), &["plan"]);
++        assert_eq!(
++            PermissionMode::Plan.preferred_wire_modes(),
++            &["plan", "read-only"]
++        );
+         assert_eq!(
+             PermissionMode::Auto.preferred_wire_modes(),
+-            &["bypassPermissions", "auto"]
++            &["bypassPermissions", "auto", "agent-full-access"]
++        );
++        assert_eq!(
++            PermissionMode::Edit.preferred_wire_modes(),
++            &["acceptEdits", "agent"]
+         );
+-        assert_eq!(PermissionMode::Edit.preferred_wire_modes(), &["acceptEdits"]);
+     }
+ 
+     #[test]
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 90732ed8d..18d498705 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -471,6 +471,15 @@ pub enum PromptSource {
+     Heartbeat,
+ }
+ 
++impl PromptSource {
++    fn channel_id(&self) -> Option<Uuid> {
++        match self {
++            Self::Channel(channel_id) => Some(*channel_id),
++            Self::Heartbeat => None,
++        }
++    }
++}
++
+ /// Apply state effects for Race 1, where a control signal arrives just after the
+ /// prompt completed naturally. The prompt result has already been consumed by
+ /// `select!`, so the harness must synthesize a successful result while still
+@@ -1597,6 +1606,18 @@ fn select_supported_permission_mode(
+         .find(|wire| agent_supports_mode(session_new_result, wire))
+ }
+ 
++fn effective_permission_mode(ctx: &PromptContext, channel_id: Option<Uuid>) -> PermissionMode {
++    channel_id
++        .and_then(|cid| {
++            ctx.session_overrides.lock().ok().and_then(|overrides| {
++                overrides
++                    .get(&cid)
++                    .and_then(|session| session.permission_mode)
++            })
++        })
++        .unwrap_or(ctx.permission_mode)
++}
++
+ /// Set the session permission mode via `session/set_config_option`.
+ ///
+ /// Non-fatal for most errors: logs and proceeds. The agent falls back to its
+@@ -2652,6 +2673,9 @@ pub async fn run_prompt_task(
+         "turn starting for {}",
+         prompt_label(&source)
+     );
++    agent
++        .acp
++        .set_permission_mode(effective_permission_mode(&ctx, source.channel_id()));
+ 
+     // When control_rx is Some (channel tasks), wrap the prompt in select! so
+     // the main loop can cancel, interrupt, or rotate it. Heartbeats

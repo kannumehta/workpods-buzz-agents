@@ -1,0 +1,1131 @@
+From 58846a70bded1a386559659e8fda6421c61d20c0 Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Mon, 17 Aug 2026 02:31:10 +0000
+Subject: [PATCH 2/6] Persist ACP sessions and resolve roster mentions
+
+---
+ crates/buzz-acp/src/acp.rs    |  60 ++++
+ crates/buzz-acp/src/config.rs |  10 +
+ crates/buzz-acp/src/lib.rs    |  96 +++++-
+ crates/buzz-acp/src/pool.rs   | 571 +++++++++++++++++++++++++++++++++-
+ 4 files changed, 716 insertions(+), 21 deletions(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index 5c75b9ba5..21b6fc00f 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -243,6 +243,23 @@ fn deep_merge(
+     }
+ }
+ 
++fn build_existing_session_params(
++    session_id: &str,
++    cwd: &str,
++    additional_directories: &[String],
++    mcp_servers: Vec<McpServer>,
++) -> serde_json::Value {
++    let mut params = serde_json::json!({
++        "sessionId": session_id,
++        "cwd": cwd,
++        "mcpServers": mcp_servers,
++    });
++    if !additional_directories.is_empty() {
++        params["additionalDirectories"] = serde_json::json!(additional_directories);
++    }
++    params
++}
++
+ /// Build the merged `CODEX_CONFIG` environment-variable value for a Codex agent spawn.
+ ///
+ /// Returns `Some(json_string)` when `has_generated_codex_config` is true (Buzz injected a
+@@ -713,6 +730,49 @@ impl AcpClient {
+             .session_id)
+     }
+ 
++    /// Load an existing ACP session into the current agent process.
++    ///
++    /// `session/load` is used by adapters that keep durable session state
++    /// outside the current process. The request intentionally mirrors the
++    /// workspace shape of `session/new`, without a system prompt.
++    pub async fn session_load(
++        &mut self,
++        session_id: &str,
++        cwd: &str,
++        additional_directories: &[String],
++        mcp_servers: Vec<McpServer>,
++    ) -> Result<serde_json::Value, AcpError> {
++        let params = build_existing_session_params(
++            session_id,
++            cwd,
++            additional_directories,
++            mcp_servers,
++        );
++        let result = self.send_request("session/load", params).await?;
++        tracing::info!(target: "acp::session", "session loaded: {session_id}");
++        Ok(result)
++    }
++
++    /// Resume an existing ACP session when the adapter supports the older
++    /// `session/resume` path instead of `session/load`.
++    pub async fn session_resume(
++        &mut self,
++        session_id: &str,
++        cwd: &str,
++        additional_directories: &[String],
++        mcp_servers: Vec<McpServer>,
++    ) -> Result<serde_json::Value, AcpError> {
++        let params = build_existing_session_params(
++            session_id,
++            cwd,
++            additional_directories,
++            mcp_servers,
++        );
++        let result = self.send_request("session/resume", params).await?;
++        tracing::info!(target: "acp::session", "session resumed: {session_id}");
++        Ok(result)
++    }
++
+     /// Send Goose's custom system-prompt request after `session/new`.
+     pub async fn session_set_goose_system_prompt(
+         &mut self,
+diff --git a/crates/buzz-acp/src/config.rs b/crates/buzz-acp/src/config.rs
+index ad101faa8..fced48af0 100644
+--- a/crates/buzz-acp/src/config.rs
++++ b/crates/buzz-acp/src/config.rs
+@@ -295,6 +295,12 @@ pub struct CliArgs {
+     )]
+     pub additional_directories: Vec<String>,
+ 
++    /// Optional JSON file used to persist channel ACP session IDs and slash
++    /// command overrides across adapter restarts. Intended for single-agent
++    /// service instances.
++    #[arg(long, env = "BUZZ_ACP_SESSION_STATE_FILE")]
++    pub session_state_file: Option<PathBuf>,
++
+     /// Seconds between heartbeat prompts. 0 = disabled.
+     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
+     pub heartbeat_interval: u64,
+@@ -552,6 +558,8 @@ pub struct Config {
+     pub session_title: Option<String>,
+     /// Additional absolute workspace directories passed to ACP `session/new`.
+     pub additional_directories: Vec<String>,
++    /// Optional JSON file backing channel ACP session IDs and overrides.
++    pub session_state_file: Option<PathBuf>,
+     /// Permission mode to apply after session creation. `Default` = skip.
+     pub permission_mode: PermissionMode,
+     /// Inbound author gate mode.
+@@ -1148,6 +1156,7 @@ impl Config {
+                 .as_deref()
+                 .and_then(sanitize_session_title),
+             additional_directories,
++            session_state_file: args.session_state_file,
+             permission_mode: args.permission_mode,
+             respond_to: args.respond_to,
+             respond_to_allowlist,
+@@ -1523,6 +1532,7 @@ mod tests {
+             model: None,
+             session_title: None,
+             additional_directories: Vec::new(),
++            session_state_file: None,
+             permission_mode: PermissionMode::Plan,
+             respond_to: RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index f25a468a4..a75371017 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -38,7 +38,7 @@ use futures_util::FutureExt;
+ use nostr::{PublicKey, ToBech32};
+ use pool::{
+     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
+-    PromptResult, PromptSource, SessionOverride, SessionState, TimeoutKind,
++    PromptResult, PromptSource, SessionOverride, SessionState, SessionStateStore, TimeoutKind,
+ };
+ use pool_lifecycle::PoolLifecycle;
+ use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
+@@ -1594,10 +1594,13 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
+ }
+ 
+ /// Result of a background respawn task.
++type SpawnedAgentInit = (AcpClient, u32, String, bool, bool);
++
+ struct RespawnResult {
+     index: usize,
+-    /// Tuple: (initialized client, protocol version, agent name).
+-    result: Result<(AcpClient, u32, String)>,
++    /// Tuple: (initialized client, protocol version, agent name,
++    /// session/load support, session/resume support).
++    result: Result<SpawnedAgentInit>,
+ }
+ 
+ /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
+@@ -1641,7 +1644,7 @@ impl RespawnGuard {
+     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
+     /// is no await boundary between marking `sent` and actually enqueueing —
+     /// cancellation cannot slip between the two.
+-    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
++    fn send(mut self, result: Result<SpawnedAgentInit>) {
+         // Invariant: try_send succeeds because the channel capacity equals the
+         // slot count, and respawn_in_flight guarantees at most one outstanding
+         // result per slot. If this ever fails, the channel sizing or the
+@@ -2003,6 +2006,23 @@ async fn tokio_main() -> Result<()> {
+ 
+     tracing::info!("buzz-acp starting: {}", config.summary());
+ 
++    let session_store = match config.session_state_file.clone() {
++        Some(path) if config.agents == 1 => Some(Arc::new(SessionStateStore::new(path))),
++        Some(path) => {
++            tracing::warn!(
++                path = %path.display(),
++                agents = config.agents,
++                "session state file is ignored when BUZZ_ACP_AGENTS is greater than 1"
++            );
++            None
++        }
++        None => None,
++    };
++    let persisted_sessions = session_store
++        .as_ref()
++        .map(|store| store.load())
++        .unwrap_or_default();
++
+     let observer = config
+         .relay_observer
+         .then(observer::ObserverHandle::in_process);
+@@ -2262,7 +2282,10 @@ async fn tokio_main() -> Result<()> {
+         context_message_limit: config.context_message_limit,
+         max_turns_per_session: config.max_turns_per_session,
+         permission_mode: config.permission_mode,
+-        session_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
++        session_overrides: Arc::new(std::sync::Mutex::new(
++            persisted_sessions.overrides.clone(),
++        )),
++        session_store: session_store.clone(),
+         agent_keys: config.keys.clone(),
+         agent_owner_pubkey: startup_owner
+             .as_deref()
+@@ -2272,6 +2295,15 @@ async fn tokio_main() -> Result<()> {
+         relay_url: config.relay_url.clone(),
+     });
+ 
++    if session_store.is_some() && config.agents == 1 {
++        pool.seed_session_state(&persisted_sessions);
++        tracing::info!(
++            target: "pool::session_store",
++            channels = persisted_sessions.state.sessions.len(),
++            "loaded persisted session state"
++        );
++    }
++
+     if !config.memory_enabled {
+         tracing::info!(
+             target: "engram::core",
+@@ -2533,7 +2565,13 @@ async fn tokio_main() -> Result<()> {
+         while let Ok(rr) = respawn_rx.try_recv() {
+             crash_history[rr.index].respawn_in_flight = false;
+             match rr.result {
+-                Ok((acp, protocol_version, agent_name)) => {
++                Ok((
++                    acp,
++                    protocol_version,
++                    agent_name,
++                    load_session_supported,
++                    resume_session_supported,
++                )) => {
+                     let agent = OwnedAgent {
+                         index: rr.index,
+                         acp,
+@@ -2543,6 +2581,8 @@ async fn tokio_main() -> Result<()> {
+                         model_overridden: false,
+                         agent_name,
+                         goose_system_prompt_supported: None,
++                        load_session_supported,
++                        resume_session_supported,
+                         protocol_version,
+                     };
+                     pool.return_agent(agent);
+@@ -2998,6 +3038,7 @@ async fn tokio_main() -> Result<()> {
+                                                             pool.invalidate_channel_sessions(
+                                                                 buzz_event.channel_id,
+                                                             );
++                                                            pool.persist_idle_session_state(&ctx);
+                                                         }
+                                                         format!(
+                                                             "Session model set to `{model}` for this channel."
+@@ -3023,6 +3064,7 @@ async fn tokio_main() -> Result<()> {
+                                                     pool.invalidate_channel_sessions(
+                                                         buzz_event.channel_id,
+                                                     );
++                                                    pool.persist_idle_session_state(&ctx);
+                                                 }
+                                                 format!(
+                                                     "Session mode set to `{mode}` for this channel."
+@@ -3066,6 +3108,7 @@ async fn tokio_main() -> Result<()> {
+                                                     pool.invalidate_channel_sessions(
+                                                         buzz_event.channel_id,
+                                                     );
++                                                    pool.persist_idle_session_state(&ctx);
+                                                 }
+                                                 "Session overrides cleared for this channel."
+                                                     .to_string()
+@@ -3561,6 +3604,9 @@ async fn tokio_main() -> Result<()> {
+                         pool = pool_lifecycle
+                             .take_ready()
+                             .expect("successful wake stores a ready pool");
++                        if session_store.is_some() && config.agents == 1 {
++                            pool.seed_session_state(&persisted_sessions);
++                        }
+                         pool_ready = true;
+                         emit_runtime_lifecycle(
+                             observer.as_ref(),
+@@ -3680,7 +3726,7 @@ async fn tokio_main() -> Result<()> {
+     // Drain any respawn results that completed before the abort. Explicitly
+     // shut down returned agents instead of relying on AcpClient::Drop.
+     while let Ok(rr) = respawn_rx.try_recv() {
+-        if let Ok((mut acp, _, _)) = rr.result {
++        if let Ok((mut acp, _, _, _, _)) = rr.result {
+             acp.shutdown().await;
+             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
+         }
+@@ -4766,6 +4812,21 @@ fn normalized_agent_name(init_result: &serde_json::Value) -> String {
+         .to_ascii_lowercase()
+ }
+ 
++fn supports_session_load(init_result: &serde_json::Value) -> bool {
++    init_result
++        .get("agentCapabilities")
++        .and_then(|caps| caps.get("loadSession"))
++        .and_then(|value| value.as_bool())
++        .unwrap_or(false)
++}
++
++fn supports_session_resume(init_result: &serde_json::Value) -> bool {
++    init_result
++        .get("sessionCapabilities")
++        .and_then(|caps| caps.get("resume"))
++        .is_some()
++}
++
+ async fn shutdown_agent_slots(slots: &mut [Option<OwnedAgent>]) {
+     for slot in slots {
+         if let Some(mut agent) = slot.take() {
+@@ -4865,6 +4926,8 @@ async fn initialize_agent_pool(
+                             }),
+                         );
+                         let agent_name = normalized_agent_name(&init_result);
++                        let load_session_supported = supports_session_load(&init_result);
++                        let resume_session_supported = supports_session_resume(&init_result);
+                         agent_slots.push(Some(OwnedAgent {
+                             index: i,
+                             acp,
+@@ -4874,6 +4937,8 @@ async fn initialize_agent_pool(
+                             model_overridden: false,
+                             agent_name,
+                             goose_system_prompt_supported: None,
++                            load_session_supported,
++                            resume_session_supported,
+                             protocol_version,
+                         }));
+                     }
+@@ -4925,7 +4990,7 @@ async fn spawn_and_init(
+     has_generated_codex_config: bool,
+     agent_index: usize,
+     observer: Option<observer::ObserverHandle>,
+-) -> Result<(AcpClient, u32, String)> {
++) -> Result<SpawnedAgentInit> {
+     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
+         .await
+         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+@@ -4943,7 +5008,15 @@ async fn spawn_and_init(
+                 }),
+             );
+             let agent_name = normalized_agent_name(&init_result);
+-            Ok((acp, protocol_version, agent_name))
++            let load_session_supported = supports_session_load(&init_result);
++            let resume_session_supported = supports_session_resume(&init_result);
++            Ok((
++                acp,
++                protocol_version,
++                agent_name,
++                load_session_supported,
++                resume_session_supported,
++            ))
+         }
+         Err(e) => {
+             // Explicitly shut down the spawned child to prevent zombie/leak.
+@@ -5555,6 +5628,7 @@ mod session_control_command_tests {
+             model: None,
+             session_title: None,
+             additional_directories: vec![],
++            session_state_file: None,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Allowlist,
+             respond_to_allowlist,
+@@ -7086,6 +7160,7 @@ mod build_mcp_servers_tests {
+             model: None,
+             session_title: None,
+             additional_directories: vec![],
++            session_state_file: None,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: std::collections::HashSet::new(),
+@@ -7311,6 +7386,7 @@ mod error_outcome_emission_tests {
+             model: None,
+             session_title: None,
+             additional_directories: vec![],
++            session_state_file: None,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
+@@ -7359,6 +7435,8 @@ mod error_outcome_emission_tests {
+             model_overridden: false,
+             agent_name: "unknown".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             // Error branches under test never read this; 1 is the legacy
+             // non-systemPrompt path, the simplest valid value.
+             protocol_version: 1,
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index a91e64459..33f0319b4 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -21,6 +21,7 @@
+ 
+ use std::cmp::Reverse;
+ use std::collections::{HashMap, HashSet};
++use std::path::PathBuf;
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+@@ -104,7 +105,7 @@ pub struct ChannelDeliveryState {
+ ///
+ /// Separated from `OwnedAgent` so the state machine is testable without
+ /// spawning a real agent subprocess.
+-#[derive(Default)]
++#[derive(Debug, Clone, Default)]
+ pub struct SessionState {
+     /// channel_id → session_id
+     pub sessions: HashMap<Uuid, String>,
+@@ -129,6 +130,10 @@ pub struct SessionState {
+     /// Per-channel successful-delivery state. Created with the ACP session and
+     /// cleared atomically with every invalidation path.
+     pub deliveries: HashMap<Uuid, ChannelDeliveryState>,
++    /// Channel sessions that have been loaded into this ACP child process.
++    /// Persisted session IDs start absent from this set and are restored lazily
++    /// before the next prompt.
++    pub loaded_sessions: HashSet<Uuid>,
+ }
+ 
+ impl SessionState {
+@@ -153,6 +158,7 @@ impl SessionState {
+         self.core_sections.remove(channel_id);
+         self.canvas_sections.remove(channel_id);
+         self.deliveries.remove(channel_id);
++        self.loaded_sessions.remove(channel_id);
+         self.sessions.remove(channel_id).is_some()
+     }
+ 
+@@ -166,6 +172,7 @@ impl SessionState {
+         self.core_sections.clear();
+         self.canvas_sections.clear();
+         self.deliveries.clear();
++        self.loaded_sessions.clear();
+     }
+ 
+     pub(crate) fn mark_channel_delivery_success(
+@@ -209,6 +216,10 @@ pub struct OwnedAgent {
+     /// the first session; method-not-found is cached as `Some(false)` so legacy
+     /// user-message framing is used for this process thereafter.
+     pub goose_system_prompt_supported: Option<bool>,
++    /// Whether the adapter advertised support for `session/load`.
++    pub load_session_supported: bool,
++    /// Whether the adapter advertised support for `session/resume`.
++    pub resume_session_supported: bool,
+     /// Protocol version reported by the agent in its initialize response.
+     pub protocol_version: u32,
+ }
+@@ -225,6 +236,164 @@ pub struct SessionOverride {
+ 
+ pub type SessionOverrides = Arc<Mutex<HashMap<Uuid, SessionOverride>>>;
+ 
++#[derive(Debug, Clone, Default)]
++pub struct PersistedSessionSnapshot {
++    pub state: SessionState,
++    pub overrides: HashMap<Uuid, SessionOverride>,
++}
++
++#[derive(Debug, Clone)]
++pub struct SessionStateStore {
++    path: Arc<PathBuf>,
++}
++
++#[derive(Debug, serde::Deserialize, serde::Serialize)]
++struct PersistedSessionFile {
++    version: u32,
++    channels: HashMap<String, PersistedChannelSession>,
++}
++
++#[derive(Debug, serde::Deserialize, serde::Serialize)]
++struct PersistedChannelSession {
++    session_id: String,
++    #[serde(default)]
++    turn_count: u32,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    model: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    permission_mode: Option<String>,
++}
++
++impl Default for PersistedSessionFile {
++    fn default() -> Self {
++        Self {
++            version: 1,
++            channels: HashMap::new(),
++        }
++    }
++}
++
++impl SessionStateStore {
++    pub fn new(path: PathBuf) -> Self {
++        Self {
++            path: Arc::new(path),
++        }
++    }
++
++    pub fn path(&self) -> &PathBuf {
++        &self.path
++    }
++
++    pub fn load(&self) -> PersistedSessionSnapshot {
++        let Ok(bytes) = std::fs::read(&*self.path) else {
++            return PersistedSessionSnapshot::default();
++        };
++        let Ok(file) = serde_json::from_slice::<PersistedSessionFile>(&bytes) else {
++            tracing::warn!(
++                target: "pool::session_store",
++                path = %self.path.display(),
++                "failed to parse session state file; starting with empty runtime state"
++            );
++            return PersistedSessionSnapshot::default();
++        };
++
++        let mut snapshot = PersistedSessionSnapshot::default();
++        for (channel, entry) in file.channels {
++            let Ok(channel_id) = channel.parse::<Uuid>() else {
++                tracing::warn!(
++                    target: "pool::session_store",
++                    channel,
++                    "ignoring invalid channel id in session state file"
++                );
++                continue;
++            };
++            if entry.session_id.trim().is_empty() {
++                continue;
++            }
++            snapshot
++                .state
++                .sessions
++                .insert(channel_id, entry.session_id);
++            if entry.turn_count > 0 {
++                snapshot.state.turn_counts.insert(channel_id, entry.turn_count);
++            }
++            let mut session_override = SessionOverride::default();
++            session_override.model = entry.model.filter(|m| !m.trim().is_empty());
++            session_override.permission_mode = entry
++                .permission_mode
++                .as_deref()
++                .and_then(parse_persisted_permission_mode);
++            if session_override.model.is_some() || session_override.permission_mode.is_some() {
++                snapshot.overrides.insert(channel_id, session_override);
++            }
++        }
++        snapshot
++    }
++
++    pub fn save(
++        &self,
++        state: &SessionState,
++        overrides: &HashMap<Uuid, SessionOverride>,
++    ) -> std::io::Result<()> {
++        if let Some(parent) = self.path.parent() {
++            std::fs::create_dir_all(parent)?;
++        }
++        let mut file = PersistedSessionFile::default();
++        for (channel_id, session_id) in &state.sessions {
++            let session_override = overrides.get(channel_id);
++            file.channels.insert(
++                channel_id.to_string(),
++                PersistedChannelSession {
++                    session_id: session_id.clone(),
++                    turn_count: state.turn_counts.get(channel_id).copied().unwrap_or(0),
++                    model: session_override.and_then(|o| o.model.clone()),
++                    permission_mode: session_override
++                        .and_then(|o| o.permission_mode)
++                        .map(|mode| mode.as_public_str().to_string()),
++                },
++            );
++        }
++        let json = serde_json::to_vec_pretty(&file)?;
++        let tmp_path = self.path.with_extension("json.tmp");
++        std::fs::write(&tmp_path, json)?;
++        std::fs::rename(tmp_path, &*self.path)
++    }
++}
++
++fn parse_persisted_permission_mode(raw: &str) -> Option<PermissionMode> {
++    match raw.trim() {
++        "plan" => Some(PermissionMode::Plan),
++        "auto" | "bypass" | "bypassPermissions" => Some(PermissionMode::Auto),
++        "edit" | "acceptEdits" => Some(PermissionMode::Edit),
++        _ => {
++            tracing::warn!(
++                target: "pool::session_store",
++                mode = raw,
++                "ignoring invalid persisted permission mode"
++            );
++            None
++        }
++    }
++}
++
++fn persist_session_state(
++    store: &SessionStateStore,
++    state: &SessionState,
++    overrides: &SessionOverrides,
++) {
++    let override_snapshot = overrides
++        .lock()
++        .map(|overrides| overrides.clone())
++        .unwrap_or_default();
++    if let Err(error) = store.save(state, &override_snapshot) {
++        tracing::warn!(
++            target: "pool::session_store",
++            path = %store.path().display(),
++            "failed to persist session state: {error}"
++        );
++    }
++}
++
+ /// Package name reported by `claude-agent-acp` in its `initialize` response.
+ /// Any adapter reporting this name supports `_meta.systemPrompt: {append: ...}`
+ /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
+@@ -605,6 +774,8 @@ pub struct PromptContext {
+     pub permission_mode: PermissionMode,
+     /// Runtime-only per-channel session overrides set by Buzz slash commands.
+     pub session_overrides: SessionOverrides,
++    /// Optional durable backing file for single-process channel sessions.
++    pub session_store: Option<Arc<SessionStateStore>>,
+     /// Agent identity — used to derive the NIP-AE conversation key at
+     /// session creation for core injection.
+     pub agent_keys: nostr::Keys,
+@@ -845,6 +1016,26 @@ impl AgentPool {
+         count
+     }
+ 
++    /// Seed idle agents from durable session state. Only intended for
++    /// single-agent service instances; callers enforce that before invoking it.
++    pub fn seed_session_state(&mut self, snapshot: &PersistedSessionSnapshot) {
++        for agent in self.agents.iter_mut().flatten() {
++            agent.state = snapshot.state.clone();
++        }
++    }
++
++    /// Persist the first idle agent's session state. The deployed service runs
++    /// one ACP child process per systemd instance, so one map is authoritative.
++    pub fn persist_idle_session_state(&self, ctx: &PromptContext) {
++        let Some(store) = &ctx.session_store else {
++            return;
++        };
++        let Some(agent) = self.agents.iter().flatten().next() else {
++            return;
++        };
++        persist_session_state(store, &agent.state, &ctx.session_overrides);
++    }
++
+     /// Check an idle channel session's cached model catalog, when available.
+     ///
+     /// `None` means there is no idle session/catalog yet, so callers should
+@@ -1172,6 +1363,107 @@ async fn create_session_and_apply_model(
+     Ok(resp.session_id)
+ }
+ 
++async fn restore_session_and_apply_config(
++    agent: &mut OwnedAgent,
++    ctx: &PromptContext,
++    channel_id: Uuid,
++    session_id: &str,
++    channel_type: Option<&str>,
++) -> Result<(), AcpError> {
++    let mcp_servers = mcp_servers_with_git_origin(
++        &ctx.mcp_servers,
++        Some(channel_id),
++        channel_type,
++        ctx.session_title.as_deref(),
++    );
++    let resp = if agent.load_session_supported {
++        match agent
++            .acp
++            .session_load(
++                session_id,
++                &ctx.cwd,
++                &ctx.additional_directories,
++                mcp_servers.clone(),
++            )
++            .await
++        {
++            Ok(resp) => resp,
++            Err(AcpError::AgentError { code: -32601, .. }) if agent.resume_session_supported => {
++                agent
++                    .acp
++                    .session_resume(
++                        session_id,
++                        &ctx.cwd,
++                        &ctx.additional_directories,
++                        mcp_servers,
++                    )
++                    .await?
++            }
++            Err(error) => return Err(error),
++        }
++    } else if agent.resume_session_supported {
++        agent
++            .acp
++            .session_resume(
++                session_id,
++                &ctx.cwd,
++                &ctx.additional_directories,
++                mcp_servers,
++            )
++            .await?
++    } else {
++        return Err(AcpError::Protocol(format!(
++            "agent {} does not support session/load or session/resume",
++            agent.agent_name
++        )));
++    };
++
++    if agent.model_capabilities.is_none() {
++        agent.model_capabilities = Some(AgentModelCapabilities {
++            config_options_raw: extract_model_config_options(&resp),
++            available_models_raw: extract_model_state(&resp),
++        });
++    }
++
++    let session_override = ctx
++        .session_overrides
++        .lock()
++        .ok()
++        .and_then(|overrides| overrides.get(&channel_id).cloned());
++    let desired_model = session_override
++        .as_ref()
++        .and_then(|session| session.model.as_ref())
++        .or(agent.desired_model.as_ref());
++    if let Some(desired) = desired_model {
++        match resolve_model_switch_method(&resp, desired) {
++            Some(method) => {
++                apply_model_switch(&mut agent.acp, session_id, desired, &method).await?;
++            }
++            None => {
++                tracing::warn!(
++                    target: "pool::model",
++                    "desired model {desired} not found while restoring session {session_id} — keeping adapter state"
++                );
++            }
++        }
++    }
++
++    let permission_mode = session_override
++        .as_ref()
++        .and_then(|session| session.permission_mode)
++        .unwrap_or(ctx.permission_mode);
++    if let Some(wire_mode) = select_supported_permission_mode(&resp, permission_mode) {
++        apply_permission_mode(&mut agent.acp, session_id, wire_mode).await?;
++    } else {
++        tracing::info!(
++            target: "pool::permission",
++            "restored session mode {permission_mode} has no advertised ACP mode for session {session_id} — using adapter/process defaults",
++        );
++    }
++
++    Ok(())
++}
++
+ fn mcp_servers_with_git_origin(
+     servers: &[McpServer],
+     channel_id: Option<Uuid>,
+@@ -1761,8 +2053,97 @@ pub async fn run_prompt_task(
+ 
+     let (session_id, is_new_session) = match &source {
+         PromptSource::Channel(cid) => {
+-            if let Some(sid) = agent.state.sessions.get(cid) {
+-                (sid.clone(), false)
++            if let Some(sid) = agent.state.sessions.get(cid).cloned() {
++                if !agent.state.loaded_sessions.contains(cid) {
++                    match restore_session_and_apply_config(
++                        &mut agent,
++                        &ctx,
++                        *cid,
++                        &sid,
++                        origin_channel_type.as_deref(),
++                    )
++                    .await
++                    {
++                        Ok(()) => {
++                            tracing::info!(
++                                target: "pool::session",
++                                "restored session {sid} for channel {cid}"
++                            );
++                            agent.state.loaded_sessions.insert(*cid);
++                            (sid, false)
++                        }
++                        Err(error) => {
++                            tracing::warn!(
++                                target: "pool::session",
++                                "failed to restore session {sid} for channel {cid}: {error}; creating a fresh session"
++                            );
++                            agent.state.invalidate_channel(cid);
++                            if let Some(store) = &ctx.session_store {
++                                persist_session_state(
++                                    store,
++                                    &agent.state,
++                                    &ctx.session_overrides,
++                                );
++                            }
++                            match create_session_and_apply_model(
++                                &mut agent,
++                                &ctx,
++                                agent_core.as_deref(),
++                                agent_canvas.as_deref(),
++                                title_channel.as_deref(),
++                                Some(*cid),
++                                origin_channel_type.as_deref(),
++                            )
++                            .await
++                            {
++                                Ok(new_sid) => {
++                                    tracing::info!(
++                                        target: "pool::session",
++                                        "created session {new_sid} for channel {cid}"
++                                    );
++                                    agent.state.sessions.insert(*cid, new_sid.clone());
++                                    agent.state.loaded_sessions.insert(*cid);
++                                    if let Some((pending_cid, section)) = pending_canvas.take() {
++                                        agent.state.canvas_sections.insert(pending_cid, section);
++                                    }
++                                    if let Some(store) = &ctx.session_store {
++                                        persist_session_state(
++                                            store,
++                                            &agent.state,
++                                            &ctx.session_overrides,
++                                        );
++                                    }
++                                    (new_sid, true)
++                                }
++                                Err(AcpError::AgentExited) => {
++                                    agent.state.invalidate_all();
++                                    send_prompt_result(
++                                        &result_tx,
++                                        &turn_id,
++                                        agent,
++                                        source,
++                                        PromptOutcome::AgentExited,
++                                        requeue_batch_if_queue(&ctx, batch),
++                                    );
++                                    return;
++                                }
++                                Err(e) => {
++                                    send_prompt_result(
++                                        &result_tx,
++                                        &turn_id,
++                                        agent,
++                                        source,
++                                        PromptOutcome::Error(e),
++                                        requeue_batch_if_queue(&ctx, batch),
++                                    );
++                                    return;
++                                }
++                            }
++                        }
++                    }
++                } else {
++                    (sid, false)
++                }
+             } else {
+                 // The title is channel-qualified (`Agent · #channel`) so one
+                 // agent in several channels doesn't produce identical session
+@@ -1795,10 +2176,14 @@ pub async fn run_prompt_task(
+                         // Seed a zero usage baseline: buzz-acp spawned this session
+                         // so prior usage is zero by definition — first turn is reliable.
+                         agent.acp.notify_session_spawned(&sid);
++                        agent.state.loaded_sessions.insert(*cid);
+                         // Commit canvas only after session creation succeeds (I3).
+                         if let Some((pending_cid, section)) = pending_canvas.take() {
+                             agent.state.canvas_sections.insert(pending_cid, section);
+                         }
++                        if let Some(store) = &ctx.session_store {
++                            persist_session_state(store, &agent.state, &ctx.session_overrides);
++                        }
+                         (sid, true)
+                     }
+                     Err(AcpError::AgentExited) => {
+@@ -2308,6 +2693,13 @@ pub async fn run_prompt_task(
+                             Ok(stop_reason) => {
+                                 log_stop_reason(&source, &stop_reason);
+                                 agent.state.invalidate(&source);
++                                if let Some(store) = &ctx.session_store {
++                                    persist_session_state(
++                                        store,
++                                        &agent.state,
++                                        &ctx.session_overrides,
++                                    );
++                                }
+                                 let retry_batch =
+                                     requeue_cancelled_batch(&ctx, control_signal, batch);
+ 
+@@ -2412,6 +2804,9 @@ pub async fn run_prompt_task(
+                             &source,
+                             &control_signal,
+                         );
++                        if let Some(store) = &ctx.session_store {
++                            persist_session_state(store, &agent.state, &ctx.session_overrides);
++                        }
+                         let usage = agent.acp.take_turn_usage();
+                         publish_agent_turn_metric(
+                             &ctx,
+@@ -2483,21 +2878,36 @@ pub async fn run_prompt_task(
+                 );
+                 agent.state.invalidate(&source);
+             }
++            if let Some(store) = &ctx.session_store {
++                persist_session_state(store, &agent.state, &ctx.session_overrides);
++            }
+ 
+             let core_stop = acp_stop_to_core(&stop_reason);
+             if let (PromptSource::Channel(_), Some(ref b)) = (&source, batch.as_ref()) {
+                 if let Some(reply_text) = agent.acp.take_last_assistant_text() {
+-                    let mentions = resolve_reply_mentions(
++                    let member_profiles =
++                        fetch_channel_member_profiles(b.channel_id, &ctx.rest_client).await;
++                    let merged_profiles =
++                        merge_profile_lookups(reply_profiles.as_ref(), member_profiles);
++                    let mention_resolution = resolve_reply_mentions(
+                         &reply_text,
+-                        reply_profiles.as_ref(),
++                        merged_profiles.as_ref(),
+                         &ctx.agent_keys.public_key().to_hex(),
+                     );
++                    if !mention_resolution.ambiguous.is_empty() {
++                        tracing::warn!(
++                            target: "pool::mentions",
++                            channel = %b.channel_id,
++                            names = ?mention_resolution.ambiguous,
++                            "not adding ambiguous outgoing mention p-tags"
++                        );
++                    }
+                     post_agent_reply(
+                         &ctx.rest_client,
+                         b.channel_id,
+                         b,
+                         &reply_text,
+-                        &mentions,
++                        &mention_resolution.pubkeys,
+                     )
+                     .await;
+                 }
+@@ -3287,6 +3697,117 @@ async fn fetch_prompt_profile_lookup(
+     .await
+ }
+ 
++async fn fetch_profiles_for_pubkeys(
++    pubkeys: &HashSet<String>,
++    rest: &RestClient,
++) -> Option<PromptProfileLookup> {
++    if pubkeys.is_empty() {
++        return None;
++    }
++    let authors: Vec<nostr::PublicKey> = pubkeys
++        .iter()
++        .filter_map(|s| nostr::PublicKey::from_hex(s).ok())
++        .collect();
++    if authors.is_empty() {
++        return None;
++    }
++    let filter = nostr::Filter::new()
++        .kind(nostr::Kind::Metadata)
++        .authors(authors);
++    fetch_with_retry(|| async {
++        match timeout(
++            CONTEXT_FETCH_TIMEOUT,
++            rest.query(std::slice::from_ref(&filter)),
++        )
++        .await
++        {
++            Ok(Ok(json)) => parse_kind0_profile_lookup(json),
++            Ok(Err(e)) => {
++                tracing::debug!("channel member profile lookup failed: {e} — will retry");
++                None
++            }
++            Err(_) => {
++                tracing::debug!("channel member profile lookup timed out — will retry");
++                None
++            }
++        }
++    })
++    .await
++}
++
++async fn fetch_channel_member_profiles(
++    channel_id: Uuid,
++    rest: &RestClient,
++) -> Option<PromptProfileLookup> {
++    use nostr::{Alphabet, SingleLetterTag};
++
++    let d_tag = SingleLetterTag::lowercase(Alphabet::D);
++    let channel = channel_id.to_string();
++    let filter = nostr::Filter::new()
++        .kind(nostr::Kind::Custom(
++            buzz_core::kind::KIND_NIP29_GROUP_MEMBERS as u16,
++        ))
++        .custom_tags(d_tag, [channel.as_str()]);
++
++    let member_events = fetch_with_retry(|| async {
++        match timeout(
++            CONTEXT_FETCH_TIMEOUT,
++            rest.query(std::slice::from_ref(&filter)),
++        )
++        .await
++        {
++            Ok(Ok(json)) => Some(json),
++            Ok(Err(e)) => {
++                tracing::debug!("channel member lookup failed: {e} — will retry");
++                None
++            }
++            Err(_) => {
++                tracing::debug!("channel member lookup timed out — will retry");
++                None
++            }
++        }
++    })
++    .await?;
++
++    let mut pubkeys = HashSet::new();
++    for event in member_events.as_array()? {
++        let Some(tags) = event.get("tags").and_then(|tags| tags.as_array()) else {
++            continue;
++        };
++        for tag in tags {
++            let Some(parts) = tag.as_array() else {
++                continue;
++            };
++            if parts.first().and_then(|v| v.as_str()) != Some("p") {
++                continue;
++            }
++            if let Some(pubkey) = parts.get(1).and_then(|v| v.as_str()) {
++                if nostr::PublicKey::from_hex(pubkey).is_ok() {
++                    pubkeys.insert(pubkey.to_ascii_lowercase());
++                }
++            }
++        }
++    }
++    fetch_profiles_for_pubkeys(&pubkeys, rest).await
++}
++
++fn merge_profile_lookups(
++    primary: Option<&PromptProfileLookup>,
++    secondary: Option<PromptProfileLookup>,
++) -> Option<PromptProfileLookup> {
++    match (primary, secondary) {
++        (None, None) => None,
++        (Some(primary), None) => Some(primary.clone()),
++        (None, Some(secondary)) => Some(secondary),
++        (Some(primary), Some(mut secondary)) => {
++            for (pubkey, profile) in primary {
++                secondary.insert(pubkey.clone(), profile.clone());
++            }
++            Some(secondary)
++        }
++    }
++}
++
+ /// Fetch thread context via Nostr query: root event by ID + replies by `#e` tag.
+ ///
+ /// The reply query intentionally requests one more reply than the configured
+@@ -4419,9 +4940,9 @@ fn resolve_reply_mentions(
+     content: &str,
+     profiles: Option<&PromptProfileLookup>,
+     sender_pubkey: &str,
+-) -> Vec<String> {
++) -> MentionResolution {
+     let Some(profiles) = profiles else {
+-        return Vec::new();
++        return MentionResolution::default();
+     };
+ 
+     let mut known_names = Vec::new();
+@@ -4448,14 +4969,35 @@ fn resolve_reply_mentions(
+ 
+     let known_refs: Vec<&str> = known_names.iter().map(String::as_str).collect();
+     let mut resolved = Vec::new();
++    let mut unresolved = Vec::new();
++    let mut ambiguous = Vec::new();
+     for name in buzz_sdk::mentions::extract_at_mentions_with_known(content, &known_refs) {
+-        if let Some(candidates) = name_to_pubkeys.get(&name) {
+-            if candidates.len() == 1 {
+-                resolved.push(candidates[0].clone());
++        match name_to_pubkeys.get(&name) {
++            Some(candidates) if candidates.len() == 1 => resolved.push(candidates[0].clone()),
++            Some(_) => {
++                if !ambiguous.contains(&name) {
++                    ambiguous.push(name);
++                }
++            }
++            None => {
++                if !unresolved.contains(&name) {
++                    unresolved.push(name);
++                }
+             }
+         }
+     }
+-    buzz_sdk::mentions::normalize_mention_pubkeys(&resolved, Some(sender_pubkey))
++    MentionResolution {
++        pubkeys: buzz_sdk::mentions::normalize_mention_pubkeys(&resolved, Some(sender_pubkey)),
++        unresolved,
++        ambiguous,
++    }
++}
++
++#[derive(Debug, Default, PartialEq, Eq)]
++struct MentionResolution {
++    pubkeys: Vec<String>,
++    unresolved: Vec<String>,
++    ambiguous: Vec<String>,
+ }
+ 
+ async fn post_agent_reply(
+@@ -7256,6 +7798,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             model_overridden: false,
+             agent_name: "unknown".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 2,
+         };
+ 
+@@ -7314,6 +7858,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             model_overridden: false,
+             agent_name: "unknown".into(),
+             goose_system_prompt_supported: None,
++            load_session_supported: false,
++            resume_session_supported: false,
+             protocol_version: 2,
+         };
+ 
+@@ -7797,6 +8343,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+             max_turns_per_session: 0,
+             permission_mode: PermissionMode::Plan,
+             session_overrides: Arc::new(Mutex::new(HashMap::new())),
++            session_store: None,
+             agent_keys: agent_keys.clone(),
+             agent_owner_pubkey: owner_pubkey,
+             memory_enabled: false,

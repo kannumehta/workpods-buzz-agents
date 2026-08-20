@@ -1,0 +1,1102 @@
+From 93c2651d0210bc91526272f9447fc6a93a2b482a Mon Sep 17 00:00:00 2001
+From: Musketeer <musketeer@example.com>
+Date: Thu, 20 Aug 2026 00:16:20 +0000
+Subject: [PATCH] Harden ACP session state persistence
+
+Signed-off-by: Musketeer <musketeer@example.com>
+---
+ crates/buzz-acp/src/acp.rs    |  21 +-
+ crates/buzz-acp/src/config.rs |  38 +-
+ crates/buzz-acp/src/lib.rs    |  49 ++-
+ crates/buzz-acp/src/pool.rs   | 642 +++++++++++++++++++++++++++++-----
+ crates/buzz-acp/src/queue.rs  |   8 +-
+ 5 files changed, 640 insertions(+), 118 deletions(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index eecce5f9e..cb254cfdf 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -751,12 +751,8 @@ impl AcpClient {
+         additional_directories: &[String],
+         mcp_servers: Vec<McpServer>,
+     ) -> Result<serde_json::Value, AcpError> {
+-        let params = build_existing_session_params(
+-            session_id,
+-            cwd,
+-            additional_directories,
+-            mcp_servers,
+-        );
++        let params =
++            build_existing_session_params(session_id, cwd, additional_directories, mcp_servers);
+         let result = self.send_request("session/load", params).await?;
+         tracing::info!(target: "acp::session", "session loaded: {session_id}");
+         Ok(result)
+@@ -771,12 +767,8 @@ impl AcpClient {
+         additional_directories: &[String],
+         mcp_servers: Vec<McpServer>,
+     ) -> Result<serde_json::Value, AcpError> {
+-        let params = build_existing_session_params(
+-            session_id,
+-            cwd,
+-            additional_directories,
+-            mcp_servers,
+-        );
++        let params =
++            build_existing_session_params(session_id, cwd, additional_directories, mcp_servers);
+         let result = self.send_request("session/resume", params).await?;
+         tracing::info!(target: "acp::session", "session resumed: {session_id}");
+         Ok(result)
+@@ -2051,7 +2043,9 @@ impl AcpClient {
+             .pointer("/params/toolCall/kind")
+             .and_then(|kind| kind.as_str());
+         let option_id = select_permission_option(options, self.permission_mode, tool_kind)
+-            .ok_or_else(|| AcpError::Protocol("permission request has no selectable option".into()))?;
++            .ok_or_else(|| {
++                AcpError::Protocol("permission request has no selectable option".into())
++            })?;
+ 
+         if matches!(self.permission_mode, PermissionMode::Auto)
+             || (matches!(self.permission_mode, PermissionMode::Edit) && tool_kind == Some("edit"))
+@@ -2481,6 +2475,7 @@ fn configure_no_window(cmd: &mut tokio::process::Command) {
+ }
+ 
+ #[cfg(test)]
++#[allow(clippy::items_after_test_module)]
+ mod tests {
+     use super::*;
+ 
+diff --git a/crates/buzz-acp/src/config.rs b/crates/buzz-acp/src/config.rs
+index c5dfa7fc0..41e9bfac5 100644
+--- a/crates/buzz-acp/src/config.rs
++++ b/crates/buzz-acp/src/config.rs
+@@ -60,6 +60,16 @@ pub enum DedupMode {
+     Queue,
+ }
+ 
++/// Startup policy when the persisted ACP session mapping cannot be loaded.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
++pub enum SessionStateOnError {
++    /// Refuse to start so a damaged mapping cannot be mistaken for an empty one.
++    #[default]
++    Abort,
++    /// Move a bad regular file aside, then start with an empty mapping.
++    Reset,
++}
++
+ /// How to handle new @mentions while a turn is already in-flight for that channel.
+ #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+ pub enum MultipleEventHandling {
+@@ -301,6 +311,10 @@ pub struct CliArgs {
+     #[arg(long, env = "BUZZ_ACP_SESSION_STATE_FILE")]
+     pub session_state_file: Option<PathBuf>,
+ 
++    /// What to do when the persisted ACP session mapping cannot be loaded.
++    #[arg(long, env = "BUZZ_ACP_SESSION_STATE_ON_ERROR", default_value = "abort")]
++    pub session_state_on_error: SessionStateOnError,
++
+     /// Seconds between heartbeat prompts. 0 = disabled.
+     #[arg(long, env = "BUZZ_ACP_HEARTBEAT_INTERVAL", default_value_t = 0)]
+     pub heartbeat_interval: u64,
+@@ -560,6 +574,8 @@ pub struct Config {
+     pub additional_directories: Vec<String>,
+     /// Optional JSON file backing channel ACP session IDs and overrides.
+     pub session_state_file: Option<PathBuf>,
++    /// Startup policy for an unreadable or invalid session state file.
++    pub session_state_on_error: SessionStateOnError,
+     /// Permission mode to apply after session creation. `Default` = skip.
+     pub permission_mode: PermissionMode,
+     /// Inbound author gate mode.
+@@ -1071,8 +1087,7 @@ impl Config {
+         };
+ 
+         let control_allowlist = validate_allowlist(&args.control_allowlist.unwrap_or_default())?;
+-        let additional_directories =
+-            validate_additional_directories(&args.additional_directories)?;
++        let additional_directories = validate_additional_directories(&args.additional_directories)?;
+ 
+         // Validate respond_to against the allowed set.
+         let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
+@@ -1157,6 +1172,7 @@ impl Config {
+                 .and_then(sanitize_session_title),
+             additional_directories,
+             session_state_file: args.session_state_file,
++            session_state_on_error: args.session_state_on_error,
+             permission_mode: args.permission_mode,
+             respond_to: args.respond_to,
+             respond_to_allowlist,
+@@ -1533,6 +1549,7 @@ mod tests {
+             session_title: None,
+             additional_directories: Vec::new(),
+             session_state_file: None,
++            session_state_on_error: SessionStateOnError::Abort,
+             permission_mode: PermissionMode::Plan,
+             respond_to: RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
+@@ -1550,6 +1567,23 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn session_state_error_policy_defaults_to_abort_and_accepts_reset() {
++        let defaults = CliArgs::try_parse_from(["buzz-acp", "--private-key", "test"])
++            .expect("parse default policy");
++        assert_eq!(defaults.session_state_on_error, SessionStateOnError::Abort);
++
++        let reset = CliArgs::try_parse_from([
++            "buzz-acp",
++            "--private-key",
++            "test",
++            "--session-state-on-error",
++            "reset",
++        ])
++        .expect("parse reset policy");
++        assert_eq!(reset.session_state_on_error, SessionStateOnError::Reset);
++    }
++
+     fn make_rule(
+         name: &str,
+         channels: ChannelScope,
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index aa9cc6b0e..c2430a020 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -1460,11 +1460,7 @@ fn handle_switch_model_control(
+     }
+ }
+ 
+-fn remove_persisted_channel_session(
+-    ctx: &PromptContext,
+-    channel_id: Uuid,
+-    reason: &'static str,
+-) {
++fn remove_persisted_channel_session(ctx: &PromptContext, channel_id: Uuid, reason: &'static str) {
+     if let Some(store) = &ctx.session_store {
+         if let Err(error) = store.remove_channel(channel_id) {
+             tracing::warn!(
+@@ -2025,10 +2021,23 @@ async fn tokio_main() -> Result<()> {
+     let session_store = config
+         .session_state_file
+         .clone()
+-        .map(|path| Arc::new(SessionStateStore::new(path)));
++        .map(|path| SessionStateStore::open(path, config.session_state_on_error))
++        .transpose()
++        .map_err(|error| anyhow::anyhow!("failed to load session state: {error}"))?
++        .map(|(store, quarantined)| {
++            if let Some(path) = quarantined {
++                tracing::error!(
++                    path = %path.display(),
++                    "invalid session state moved aside by explicit reset policy"
++                );
++            }
++            Arc::new(store)
++        });
+     let persisted_sessions = session_store
+         .as_ref()
+         .map(|store| store.load())
++        .transpose()
++        .map_err(|error| anyhow::anyhow!("failed to read loaded session state: {error}"))?
+         .unwrap_or_default();
+ 
+     let observer = config
+@@ -2290,9 +2299,7 @@ async fn tokio_main() -> Result<()> {
+         context_message_limit: config.context_message_limit,
+         max_turns_per_session: config.max_turns_per_session,
+         permission_mode: config.permission_mode,
+-        session_overrides: Arc::new(std::sync::Mutex::new(
+-            persisted_sessions.overrides.clone(),
+-        )),
++        session_overrides: Arc::new(std::sync::Mutex::new(persisted_sessions.overrides.clone())),
+         session_store: session_store.clone(),
+         agent_keys: config.keys.clone(),
+         agent_owner_pubkey: startup_owner
+@@ -5183,7 +5190,9 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
+     // so shutdown() runs on all paths (success, error, timeout).
+     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
+         let init = client.initialize().await?;
+-        let session = client.session_new_full(&cwd, &[], vec![], None, None).await?;
++        let session = client
++            .session_new_full(&cwd, &[], vec![], None, None)
++            .await?;
+         Ok::<_, acp::AcpError>((init, session))
+     })
+     .await;
+@@ -5640,6 +5649,7 @@ mod session_control_command_tests {
+             session_title: None,
+             additional_directories: vec![],
+             session_state_file: None,
++            session_state_on_error: config::SessionStateOnError::Abort,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Allowlist,
+             respond_to_allowlist,
+@@ -5660,7 +5670,9 @@ mod session_control_command_tests {
+     #[test]
+     fn parses_reserved_session_commands_after_mentions() {
+         assert_eq!(
+-            parse_session_control_command("@claude /model sonnet").unwrap().unwrap(),
++            parse_session_control_command("@claude /model sonnet")
++                .unwrap()
++                .unwrap(),
+             SessionControlCommand::SetModel("sonnet".into())
+         );
+         assert_eq!(
+@@ -5676,15 +5688,14 @@ mod session_control_command_tests {
+             SessionControlCommand::SetMode(PermissionMode::Edit)
+         );
+         assert_eq!(
+-            parse_session_control_command("nostr:npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv8h6x /session")
+-                .unwrap()
+-                .unwrap(),
++            parse_session_control_command(
++                "nostr:npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqv8h6x /session"
++            )
++            .unwrap()
++            .unwrap(),
+             SessionControlCommand::ShowSession
+         );
+-        assert_eq!(
+-            parse_session_control_command("@claude /goal ship it"),
+-            None
+-        );
++        assert_eq!(parse_session_control_command("@claude /goal ship it"), None);
+         assert!(parse_session_control_command("@claude /mode turbo")
+             .unwrap()
+             .is_err());
+@@ -7173,6 +7184,7 @@ mod build_mcp_servers_tests {
+             session_title: None,
+             additional_directories: vec![],
+             session_state_file: None,
++            session_state_on_error: config::SessionStateOnError::Abort,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: std::collections::HashSet::new(),
+@@ -7399,6 +7411,7 @@ mod error_outcome_emission_tests {
+             session_title: None,
+             additional_directories: vec![],
+             session_state_file: None,
++            session_state_on_error: config::SessionStateOnError::Abort,
+             permission_mode: config::PermissionMode::Plan,
+             respond_to: config::RespondTo::Anyone,
+             respond_to_allowlist: HashSet::new(),
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 9d7c44c50..1667446c1 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -21,7 +21,11 @@
+ 
+ use std::cmp::Reverse;
+ use std::collections::{HashMap, HashSet};
+-use std::path::PathBuf;
++#[cfg(unix)]
++use std::fs::File;
++use std::fs::OpenOptions;
++use std::io::{self, Write};
++use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+@@ -35,7 +39,7 @@ use crate::acp::{
+     resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer, ModelSwitchMethod,
+     StopReason, SystemPromptTransport,
+ };
+-use crate::config::{compose_session_title, DedupMode, PermissionMode};
++use crate::config::{compose_session_title, DedupMode, PermissionMode, SessionStateOnError};
+ use crate::observer;
+ use crate::queue::{
+     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
+@@ -247,15 +251,17 @@ pub struct PersistedSessionSnapshot {
+ #[derive(Debug, Clone)]
+ pub struct SessionStateStore {
+     path: Arc<PathBuf>,
++    file: Arc<Mutex<PersistedSessionFile>>,
+ }
+ 
+-#[derive(Debug, serde::Deserialize, serde::Serialize)]
++#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+ struct PersistedSessionFile {
+     version: u32,
++    #[serde(deserialize_with = "deserialize_session_channels")]
+     channels: HashMap<String, PersistedChannelSession>,
+ }
+ 
+-#[derive(Debug, serde::Deserialize, serde::Serialize)]
++#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+ struct PersistedChannelSession {
+     session_id: String,
+     #[serde(default)]
+@@ -266,6 +272,42 @@ struct PersistedChannelSession {
+     permission_mode: Option<String>,
+ }
+ 
++fn deserialize_session_channels<'de, D>(
++    deserializer: D,
++) -> Result<HashMap<String, PersistedChannelSession>, D::Error>
++where
++    D: serde::Deserializer<'de>,
++{
++    struct ChannelsVisitor;
++
++    impl<'de> serde::de::Visitor<'de> for ChannelsVisitor {
++        type Value = HashMap<String, PersistedChannelSession>;
++
++        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            formatter.write_str("a map of unique channel IDs to ACP sessions")
++        }
++
++        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
++        where
++            A: serde::de::MapAccess<'de>,
++        {
++            let mut channels = HashMap::with_capacity(map.size_hint().unwrap_or(0));
++            while let Some((channel, session)) =
++                map.next_entry::<String, PersistedChannelSession>()?
++            {
++                if channels.insert(channel.clone(), session).is_some() {
++                    return Err(serde::de::Error::custom(format!(
++                        "duplicate session state channel {channel:?}"
++                    )));
++                }
++            }
++            Ok(channels)
++        }
++    }
++
++    deserializer.deserialize_map(ChannelsVisitor)
++}
++
+ impl Default for PersistedSessionFile {
+     fn default() -> Self {
+         Self {
+@@ -276,77 +318,206 @@ impl Default for PersistedSessionFile {
+ }
+ 
+ impl SessionStateStore {
+-    pub fn new(path: PathBuf) -> Self {
+-        Self {
++    pub fn new(path: PathBuf) -> io::Result<Self> {
++        let file = Self::read_file(&path)?;
++        Ok(Self {
+             path: Arc::new(path),
++            file: Arc::new(Mutex::new(file)),
++        })
++    }
++
++    pub fn open(
++        path: PathBuf,
++        on_error: SessionStateOnError,
++    ) -> io::Result<(Self, Option<PathBuf>)> {
++        match Self::new(path.clone()) {
++            Ok(store) => Ok((store, None)),
++            Err(initial_error) if on_error == SessionStateOnError::Reset => {
++                let quarantined = Self::quarantine(&path).map_err(|reset_error| {
++                    io::Error::new(
++                        reset_error.kind(),
++                        format!(
++                            "failed to load session state ({initial_error}); reset failed: {reset_error}"
++                        ),
++                    )
++                })?;
++                let store = Self::new(path).map_err(|reset_error| {
++                    io::Error::new(
++                        reset_error.kind(),
++                        format!(
++                            "session state was moved to {}; failed to initialize replacement: {reset_error}",
++                            quarantined.display()
++                        ),
++                    )
++                })?;
++                Ok((store, Some(quarantined)))
++            }
++            Err(error) => Err(error),
+         }
+     }
+ 
++    fn quarantine(path: &Path) -> io::Result<PathBuf> {
++        let metadata = std::fs::symlink_metadata(path)?;
++        if !metadata.file_type().is_file() {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "session state reset only accepts a regular file",
++            ));
++        }
++        let file_name = path
++            .file_name()
++            .and_then(|name| name.to_str())
++            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid state filename"))?;
++        let quarantined = path.with_file_name(format!(
++            "{file_name}.corrupt.{}",
++            Uuid::new_v4().as_simple()
++        ));
++        std::fs::rename(path, &quarantined)?;
++        Self::sync_parent(path)?;
++        Ok(quarantined)
++    }
++
+     pub fn path(&self) -> &PathBuf {
+         &self.path
+     }
+ 
+-    pub fn load(&self) -> PersistedSessionSnapshot {
+-        let Ok(bytes) = std::fs::read(&*self.path) else {
+-            return PersistedSessionSnapshot::default();
+-        };
+-        let Ok(file) = serde_json::from_slice::<PersistedSessionFile>(&bytes) else {
+-            tracing::warn!(
+-                target: "pool::session_store",
+-                path = %self.path.display(),
+-                "failed to parse session state file; starting with empty runtime state"
+-            );
+-            return PersistedSessionSnapshot::default();
+-        };
++    pub fn load(&self) -> io::Result<PersistedSessionSnapshot> {
++        let file = self.lock_file()?.clone();
++        Self::snapshot(file)
++    }
+ 
++    fn snapshot(file: PersistedSessionFile) -> io::Result<PersistedSessionSnapshot> {
+         let mut snapshot = PersistedSessionSnapshot::default();
+         for (channel, entry) in file.channels {
+-            let Ok(channel_id) = channel.parse::<Uuid>() else {
+-                tracing::warn!(
+-                    target: "pool::session_store",
+-                    channel,
+-                    "ignoring invalid channel id in session state file"
+-                );
+-                continue;
+-            };
+-            if entry.session_id.trim().is_empty() {
+-                continue;
+-            }
+-            snapshot
+-                .state
+-                .sessions
+-                .insert(channel_id, entry.session_id);
++            let channel_id = channel.parse::<Uuid>().map_err(|error| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("invalid session state channel {channel:?}: {error}"),
++                )
++            })?;
++            snapshot.state.sessions.insert(channel_id, entry.session_id);
+             if entry.turn_count > 0 {
+-                snapshot.state.turn_counts.insert(channel_id, entry.turn_count);
++                snapshot
++                    .state
++                    .turn_counts
++                    .insert(channel_id, entry.turn_count);
+             }
+-            let mut session_override = SessionOverride::default();
+-            session_override.model = entry.model.filter(|m| !m.trim().is_empty());
+-            session_override.permission_mode = entry
+-                .permission_mode
+-                .as_deref()
+-                .and_then(parse_persisted_permission_mode);
++            let session_override = SessionOverride {
++                model: entry.model.filter(|m| !m.trim().is_empty()),
++                permission_mode: entry
++                    .permission_mode
++                    .as_deref()
++                    .and_then(parse_persisted_permission_mode),
++            };
+             if session_override.model.is_some() || session_override.permission_mode.is_some() {
+                 snapshot.overrides.insert(channel_id, session_override);
+             }
+         }
+-        snapshot
++        Ok(snapshot)
+     }
+ 
+-    fn load_file(&self) -> PersistedSessionFile {
+-        let Ok(bytes) = std::fs::read(&*self.path) else {
+-            return PersistedSessionFile::default();
++    fn read_file(path: &Path) -> io::Result<PersistedSessionFile> {
++        let bytes = match std::fs::read(path) {
++            Ok(bytes) => bytes,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                return Ok(PersistedSessionFile::default());
++            }
++            Err(error) => return Err(error),
+         };
+-        serde_json::from_slice::<PersistedSessionFile>(&bytes).unwrap_or_default()
++        let file: PersistedSessionFile = serde_json::from_slice(&bytes).map_err(|error| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("invalid session state JSON: {error}"),
++            )
++        })?;
++        Self::validate_file(&file)?;
++        Ok(file)
+     }
+ 
+-    fn write_file(&self, file: &PersistedSessionFile) -> std::io::Result<()> {
++    fn validate_file(file: &PersistedSessionFile) -> io::Result<()> {
++        if file.version != 1 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("unsupported session state version {}", file.version),
++            ));
++        }
++        for (channel, entry) in &file.channels {
++            channel.parse::<Uuid>().map_err(|error| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("invalid session state channel {channel:?}: {error}"),
++                )
++            })?;
++            if entry.session_id.trim().is_empty() {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("empty session id for channel {channel}"),
++                ));
++            }
++            if let Some(mode) = entry.permission_mode.as_deref() {
++                if parse_persisted_permission_mode(mode).is_none() {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidData,
++                        format!("invalid permission mode {mode:?} for channel {channel}"),
++                    ));
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn write_file(&self, file: &PersistedSessionFile) -> io::Result<()> {
+         if let Some(parent) = self.path.parent() {
+             std::fs::create_dir_all(parent)?;
+         }
+         let json = serde_json::to_vec_pretty(&file)?;
+-        let tmp_path = self.path.with_extension("json.tmp");
+-        std::fs::write(&tmp_path, json)?;
+-        std::fs::rename(tmp_path, &*self.path)
++        let file_name = self
++            .path
++            .file_name()
++            .and_then(|name| name.to_str())
++            .unwrap_or("sessions.json");
++        let tmp_path = self
++            .path
++            .with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4().as_simple()));
++
++        let result = (|| -> io::Result<()> {
++            let mut options = OpenOptions::new();
++            options.create_new(true).write(true);
++            #[cfg(unix)]
++            {
++                use std::os::unix::fs::OpenOptionsExt;
++                options.mode(0o600);
++            }
++            let mut tmp = options.open(&tmp_path)?;
++            tmp.write_all(&json)?;
++            tmp.sync_all()?;
++            std::fs::rename(&tmp_path, &*self.path)?;
++            Self::sync_parent(&self.path)?;
++            Ok(())
++        })();
++        if result.is_err() {
++            let _ = std::fs::remove_file(&tmp_path);
++        }
++        result
++    }
++
++    #[cfg(unix)]
++    fn sync_parent(path: &Path) -> io::Result<()> {
++        if let Some(parent) = path.parent() {
++            File::open(parent)?.sync_all()?;
++        }
++        Ok(())
++    }
++
++    #[cfg(not(unix))]
++    fn sync_parent(_path: &Path) -> io::Result<()> {
++        Ok(())
++    }
++
++    fn lock_file(&self) -> io::Result<std::sync::MutexGuard<'_, PersistedSessionFile>> {
++        self.file
++            .lock()
++            .map_err(|_| io::Error::other("session state lock poisoned"))
+     }
+ 
+     pub fn save_channel(
+@@ -354,11 +525,12 @@ impl SessionStateStore {
+         channel_id: Uuid,
+         state: &SessionState,
+         overrides: &HashMap<Uuid, SessionOverride>,
+-    ) -> std::io::Result<()> {
++    ) -> io::Result<()> {
+         let Some(session_id) = state.sessions.get(&channel_id) else {
+             return self.remove_channel(channel_id);
+         };
+-        let mut file = self.load_file();
++        let mut current = self.lock_file()?;
++        let mut file = current.clone();
+         let session_override = overrides.get(&channel_id);
+         file.channels.insert(
+             channel_id.to_string(),
+@@ -371,13 +543,18 @@ impl SessionStateStore {
+                     .map(|mode| mode.as_public_str().to_string()),
+             },
+         );
+-        self.write_file(&file)
++        self.write_file(&file)?;
++        *current = file;
++        Ok(())
+     }
+ 
+-    pub fn remove_channel(&self, channel_id: Uuid) -> std::io::Result<()> {
+-        let mut file = self.load_file();
++    pub fn remove_channel(&self, channel_id: Uuid) -> io::Result<()> {
++        let mut current = self.lock_file()?;
++        let mut file = current.clone();
+         file.channels.remove(&channel_id.to_string());
+-        self.write_file(&file)
++        self.write_file(&file)?;
++        *current = file;
++        Ok(())
+     }
+ }
+ 
+@@ -1089,11 +1266,7 @@ impl AgentPool {
+     /// `None` means there is no idle session/catalog yet, so callers should
+     /// accept the override and let fresh session creation perform final
+     /// validation against the adapter's live `session/new` response.
+-    pub fn idle_channel_model_supported(
+-        &self,
+-        channel_id: Uuid,
+-        model_id: &str,
+-    ) -> Option<bool> {
++    pub fn idle_channel_model_supported(&self, channel_id: Uuid, model_id: &str) -> Option<bool> {
+         let agent = self
+             .agents
+             .iter()
+@@ -3071,7 +3244,7 @@ pub async fn run_prompt_task(
+             }
+ 
+             let core_stop = acp_stop_to_core(&stop_reason);
+-            if let (PromptSource::Channel(_), Some(ref b)) = (&source, batch.as_ref()) {
++            if let (PromptSource::Channel(_), Some(b)) = (&source, batch.as_ref()) {
+                 if let Some(reply_text) = agent.acp.take_last_assistant_text() {
+                     let member_profiles =
+                         fetch_channel_member_profiles(b.channel_id, &ctx.rest_client).await;
+@@ -5342,11 +5515,12 @@ mod tests {
+     }
+ 
+     fn temp_session_store() -> (SessionStateStore, PathBuf) {
+-        let path = std::env::temp_dir().join(format!(
+-            "buzz-acp-session-store-{}.json",
+-            Uuid::new_v4()
+-        ));
+-        (SessionStateStore::new(path.clone()), path)
++        let path =
++            std::env::temp_dir().join(format!("buzz-acp-session-store-{}.json", Uuid::new_v4()));
++        (
++            SessionStateStore::new(path.clone()).expect("create session store"),
++            path,
++        )
+     }
+ 
+     #[test]
+@@ -5377,9 +5551,15 @@ mod tests {
+             .save_channel(channel_b, &state_b, &overrides_b)
+             .expect("save channel b");
+ 
+-        let snapshot = store.load();
+-        assert_eq!(snapshot.state.sessions.get(&channel_a).unwrap(), "session-a");
+-        assert_eq!(snapshot.state.sessions.get(&channel_b).unwrap(), "session-b");
++        let snapshot = store.load().expect("load session store");
++        assert_eq!(
++            snapshot.state.sessions.get(&channel_a).unwrap(),
++            "session-a"
++        );
++        assert_eq!(
++            snapshot.state.sessions.get(&channel_b).unwrap(),
++            "session-b"
++        );
+         assert_eq!(snapshot.state.turn_counts.get(&channel_a), Some(&7));
+         assert_eq!(
+             snapshot.overrides.get(&channel_a).unwrap().permission_mode,
+@@ -5411,8 +5591,11 @@ mod tests {
+             .save_channel(channel, &state, &overrides)
+             .expect("save updated override");
+ 
+-        let snapshot = store.load();
+-        assert_eq!(snapshot.state.sessions.get(&channel).unwrap(), "stable-session");
++        let snapshot = store.load().expect("load session store");
++        assert_eq!(
++            snapshot.state.sessions.get(&channel).unwrap(),
++            "stable-session"
++        );
+         assert_eq!(
+             snapshot.overrides.get(&channel).unwrap().model.as_deref(),
+             Some("sonnet")
+@@ -5462,13 +5645,308 @@ mod tests {
+                 .expect("save channel");
+         }
+ 
+-        store
+-            .remove_channel(channel_a)
+-            .expect("remove one channel");
++        store.remove_channel(channel_a).expect("remove one channel");
+ 
+-        let snapshot = store.load();
++        let snapshot = store.load().expect("load session store");
+         assert!(!snapshot.state.sessions.contains_key(&channel_a));
+-        assert_eq!(snapshot.state.sessions.get(&channel_b).unwrap(), "session-b");
++        assert_eq!(
++            snapshot.state.sessions.get(&channel_b).unwrap(),
++            "session-b"
++        );
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_reopens_persisted_sessions_after_restart() {
++        let (store, path) = temp_session_store();
++        let channel = Uuid::new_v4();
++        let mut state = SessionState::default();
++        state.sessions.insert(channel, "durable-session".into());
++        state.turn_counts.insert(channel, 12);
++        store
++            .save_channel(channel, &state, &HashMap::new())
++            .expect("persist session");
++        drop(store);
++
++        let reopened = SessionStateStore::new(path.clone()).expect("reopen session store");
++        let snapshot = reopened.load().expect("load reopened session store");
++        assert_eq!(
++            snapshot.state.sessions.get(&channel).map(String::as_str),
++            Some("durable-session")
++        );
++        assert_eq!(snapshot.state.turn_counts.get(&channel), Some(&12));
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_missing_file_starts_empty() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-missing-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        let store = SessionStateStore::new(path).expect("open missing session store");
++        let snapshot = store.load().expect("load empty session store");
++        assert!(snapshot.state.sessions.is_empty());
++        assert!(snapshot.overrides.is_empty());
++    }
++
++    #[test]
++    fn session_store_rejects_malformed_json() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-malformed-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        std::fs::write(&path, b"{not-json").expect("write malformed state");
++        let error = SessionStateStore::new(path.clone()).expect_err("reject malformed state");
++        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_explicit_reset_quarantines_bad_regular_file() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-reset-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        let original = b"{not-json";
++        std::fs::write(&path, original).expect("write malformed state");
++
++        let (store, quarantined) =
++            SessionStateStore::open(path.clone(), SessionStateOnError::Reset)
++                .expect("explicit reset should recover a regular file");
++        let quarantined = quarantined.expect("reset reports quarantined path");
++
++        assert!(!path.exists());
++        assert_eq!(std::fs::read(&quarantined).unwrap(), original);
++        assert!(store.load().unwrap().state.sessions.is_empty());
++        let _ = std::fs::remove_file(quarantined);
++    }
++
++    #[test]
++    fn session_store_abort_policy_preserves_bad_file() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-abort-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        let original = b"{not-json";
++        std::fs::write(&path, original).expect("write malformed state");
++
++        SessionStateStore::open(path.clone(), SessionStateOnError::Abort)
++            .expect_err("abort remains the default behavior");
++
++        assert_eq!(std::fs::read(&path).unwrap(), original);
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_rejects_unknown_or_missing_version() {
++        for document in [
++            json!({"version": 2, "channels": {}}),
++            json!({"channels": {}}),
++        ] {
++            let path = std::env::temp_dir().join(format!(
++                "buzz-acp-version-session-store-{}.json",
++                Uuid::new_v4()
++            ));
++            std::fs::write(&path, serde_json::to_vec(&document).unwrap())
++                .expect("write invalid version state");
++            let error = SessionStateStore::new(path.clone()).expect_err("reject invalid version");
++            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++            let _ = std::fs::remove_file(path);
++        }
++    }
++
++    #[test]
++    fn session_store_rejects_invalid_channel_and_empty_session() {
++        for document in [
++            json!({
++                "version": 1,
++                "channels": {"not-a-uuid": {"session_id": "session"}}
++            }),
++            json!({
++                "version": 1,
++                "channels": {Uuid::new_v4().to_string(): {"session_id": "  "}}
++            }),
++        ] {
++            let path = std::env::temp_dir().join(format!(
++                "buzz-acp-invalid-session-store-{}.json",
++                Uuid::new_v4()
++            ));
++            std::fs::write(&path, serde_json::to_vec(&document).unwrap())
++                .expect("write invalid state");
++            let error = SessionStateStore::new(path.clone()).expect_err("reject invalid state");
++            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++            let _ = std::fs::remove_file(path);
++        }
++    }
++
++    #[test]
++    fn session_store_rejects_duplicate_channel_entries() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-duplicate-session-store-{}.json",
++            Uuid::new_v4()
++        ));
++        let channel = Uuid::new_v4();
++        let document = format!(
++            r#"{{"version":1,"channels":{{"{channel}":{{"session_id":"first"}},"{channel}":{{"session_id":"second"}}}}}}"#
++        );
++        std::fs::write(&path, document).expect("write duplicate state");
++        let error = SessionStateStore::new(path.clone()).expect_err("reject duplicate channel");
++        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[test]
++    fn session_store_rejects_read_errors() {
++        let path = std::env::temp_dir().join(format!(
++            "buzz-acp-session-store-directory-{}",
++            Uuid::new_v4()
++        ));
++        std::fs::create_dir(&path).expect("create directory at state path");
++        SessionStateStore::new(path.clone()).expect_err("reject unreadable state path");
++        SessionStateStore::open(path.clone(), SessionStateOnError::Reset)
++            .expect_err("reset refuses non-regular state paths");
++        let _ = std::fs::remove_dir(path);
++    }
++
++    #[test]
++    fn session_store_serializes_concurrent_channel_saves() {
++        let (store, path) = temp_session_store();
++        let channels: Vec<_> = (0..32).map(|_| Uuid::new_v4()).collect();
++        let handles: Vec<_> = channels
++            .iter()
++            .copied()
++            .enumerate()
++            .map(|(index, channel)| {
++                let store = store.clone();
++                std::thread::spawn(move || {
++                    let mut state = SessionState::default();
++                    state.sessions.insert(channel, format!("session-{index}"));
++                    store
++                        .save_channel(channel, &state, &HashMap::new())
++                        .expect("save concurrent channel");
++                })
++            })
++            .collect();
++        for handle in handles {
++            handle.join().expect("join concurrent save");
++        }
++        drop(store);
++
++        let reopened = SessionStateStore::new(path.clone()).expect("reopen session store");
++        let snapshot = reopened.load().expect("load concurrent session store");
++        assert_eq!(snapshot.state.sessions.len(), channels.len());
++        for channel in channels {
++            assert!(snapshot.state.sessions.contains_key(&channel));
++        }
++        let _ = std::fs::remove_file(path);
++    }
++
++    #[tokio::test]
++    async fn session_store_restart_restores_exact_session_before_prompt() {
++        let (store, path) = temp_session_store();
++        let channel_id = Uuid::new_v4();
++        let mut persisted_state = SessionState::default();
++        persisted_state
++            .sessions
++            .insert(channel_id, "session-before-restart".into());
++        store
++            .save_channel(channel_id, &persisted_state, &HashMap::new())
++            .expect("persist pre-restart session");
++        drop(store);
++
++        let reopened = SessionStateStore::new(path.clone()).expect("reopen session store");
++        let snapshot = reopened.load().expect("load reopened session state");
++        let capture = std::env::temp_dir().join(format!(
++            "buzz-acp-session-restart-requests-{}.ndjson",
++            Uuid::new_v4()
++        ));
++        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
++        let script = format!(
++            r#"count=0
++while IFS= read -r line; do
++  printf '%s\n' "$line" >> '{quoted_capture}'
++  if [ "$count" -eq 0 ]; then
++    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{}}}}'
++  else
++    printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"stopReason":"end_turn"}}}}'
++  fi
++  count=$((count + 1))
++done"#
++        );
++        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
++            .await
++            .expect("spawn restart ACP script");
++        let agent = OwnedAgent {
++            index: 0,
++            acp,
++            state: snapshot.state,
++            model_capabilities: None,
++            desired_model: None,
++            model_overridden: false,
++            agent_name: "restart-test-agent".into(),
++            goose_system_prompt_supported: None,
++            load_session_supported: true,
++            resume_session_supported: false,
++            protocol_version: 1,
++        };
++
++        let event = EventBuilder::new(Kind::Custom(9), "continue after restart")
++            .sign_with_keys(&Keys::generate())
++            .expect("sign restart test event");
++        let batch = FlushBatch {
++            channel_id,
++            events: vec![crate::queue::BatchEvent {
++                event,
++                prompt_tag: "test".into(),
++                received_at: std::time::Instant::now(),
++            }],
++            cancelled_events: vec![],
++            cancel_reason: None,
++        };
++        let mut ctx = make_prompt_context_no_owner();
++        ctx.session_store = Some(Arc::new(reopened));
++        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
++        run_prompt_task(
++            agent,
++            Some(batch),
++            None,
++            Arc::new(ctx),
++            result_tx,
++            None,
++            "restart-turn".into(),
++        )
++        .await;
++
++        let mut result = result_rx.recv().await.expect("restart prompt result");
++        assert!(matches!(
++            result.outcome,
++            PromptOutcome::Ok(StopReason::EndTurn)
++        ));
++        assert_eq!(
++            result
++                .agent
++                .state
++                .sessions
++                .get(&channel_id)
++                .map(String::as_str),
++            Some("session-before-restart")
++        );
++        result.agent.acp.shutdown().await;
++
++        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
++            .expect("read restart ACP capture")
++            .lines()
++            .map(|line| serde_json::from_str(line).expect("captured request is JSON"))
++            .collect();
++        assert_eq!(requests.len(), 2);
++        assert_eq!(requests[0]["method"], "session/load");
++        assert_eq!(requests[0]["params"]["sessionId"], "session-before-restart");
++        assert_eq!(requests[1]["method"], "session/prompt");
++        assert!(requests
++            .iter()
++            .all(|request| request["method"] != "session/new"));
++        let _ = std::fs::remove_file(capture);
+         let _ = std::fs::remove_file(path);
+     }
+ 
+@@ -6914,17 +7392,13 @@ done"#
+                 let mut buf = [0_u8; 4096];
+                 let mut header_end = None;
+                 let mut content_len = None;
+-                loop {
+-                    let Ok(n) = socket.read(&mut buf).await else {
+-                        break;
+-                    };
++                while let Ok(n) = socket.read(&mut buf).await {
+                     if n == 0 {
+                         break;
+                     }
+                     bytes.extend_from_slice(&buf[..n]);
+                     if header_end.is_none() {
+-                        if let Some(pos) =
+-                            bytes.windows(4).position(|window| window == b"\r\n\r\n")
++                        if let Some(pos) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                         {
+                             header_end = Some(pos + 4);
+                             let headers = String::from_utf8_lossy(&bytes[..pos]);
+@@ -7052,7 +7526,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'"#;
+ 
+         let posted_reply = posted_reply.expect("assistant reply event submitted");
+         let tags = posted_reply["tags"].as_array().expect("reply tags");
+-        assert!(tags.iter().any(|tag| tag == &json!(["h", channel_id.to_string()])));
++        assert!(tags
++            .iter()
++            .any(|tag| tag == &json!(["h", channel_id.to_string()])));
+         assert!(tags
+             .iter()
+             .any(|tag| tag == &json!(["e", trigger_id, "", "reply"])));
+diff --git a/crates/buzz-acp/src/queue.rs b/crates/buzz-acp/src/queue.rs
+index d316f8d4f..dea009afd 100644
+--- a/crates/buzz-acp/src/queue.rs
++++ b/crates/buzz-acp/src/queue.rs
+@@ -1211,7 +1211,7 @@ fn format_context_hints(
+         } else {
+             "This is a direct message."
+         };
+-        let mut s = format!(
++        let s = format!(
+             "[Context]\n\
+              Scope: dm\n\
+              Channel: {channel_display}\n\
+@@ -3304,7 +3304,11 @@ mod tests {
+         )
+         .join("\n\n");
+ 
+-        let short_author = format!("{}...{}", &author_hex[..8], &author_hex[author_hex.len() - 4..]);
++        let short_author = format!(
++            "{}...{}",
++            &author_hex[..8],
++            &author_hex[author_hex.len() - 4..]
++        );
+         assert!(prompt.contains(&format!("From: Wes ({short_author})")));
+         assert!(prompt.contains("[1]\nFrom: Wes ("));
+         assert!(!prompt.contains("mentions=["));

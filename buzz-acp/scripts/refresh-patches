@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  printf 'usage: %s SOURCE_WORKTREE\n' "$0" >&2
+  exit 2
+fi
+
+SOURCE="$(cd -- "$1" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BUZZ_ACP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+PATCH_DIR="$BUZZ_ACP_DIR/patches"
+
+# shellcheck source=../UPSTREAM
+source "$BUZZ_ACP_DIR/UPSTREAM"
+
+test -z "$(git -C "$SOURCE" status --porcelain)" || {
+  printf 'source worktree is dirty: %s\n' "$SOURCE" >&2
+  exit 1
+}
+git -C "$SOURCE" merge-base --is-ancestor "$UPSTREAM_REV" HEAD
+
+head="$(git -C "$SOURCE" rev-parse HEAD)"
+tree="$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')"
+count="$(git -C "$SOURCE" rev-list --count "$UPSTREAM_REV..HEAD")"
+test "$count" -eq 6 || {
+  printf 'expected 6 commits after %s, found %s\n' "$UPSTREAM_REV" "$count" >&2
+  exit 1
+}
+
+find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -delete
+git -C "$SOURCE" format-patch --no-signature -o "$PATCH_DIR" "$UPSTREAM_REV..HEAD"
+test "$(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' | wc -l)" -eq 6
+
+sed -i "s/^PATCH_HEAD=.*/PATCH_HEAD=$head/" "$BUZZ_ACP_DIR/UPSTREAM"
+sed -i "s/^PATCH_TREE=.*/PATCH_TREE=$tree/" "$BUZZ_ACP_DIR/UPSTREAM"
+"$SCRIPT_DIR/build"

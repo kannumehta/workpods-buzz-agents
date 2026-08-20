@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  printf 'usage: %s NEW_UPSTREAM_REV\n' "$0" >&2
+  exit 2
+fi
+
+NEW_REV="$1"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BUZZ_ACP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=../UPSTREAM
+source "$BUZZ_ACP_DIR/UPSTREAM"
+
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/workpods-buzz-rebase.XXXXXX")"
+output="$(mktemp -d "$BUZZ_ACP_DIR/rebased-patches.XXXXXX")"
+cleanup() {
+  rm -rf -- "$tmp"
+}
+trap cleanup EXIT
+
+git -C "$tmp" init
+git -C "$tmp" remote add origin "$UPSTREAM_URL"
+git -C "$tmp" fetch --depth=1 origin "$UPSTREAM_REV"
+git -C "$tmp" fetch --depth=1 origin "$NEW_REV"
+base="$(git -C "$tmp" rev-parse FETCH_HEAD)"
+git -C "$tmp" checkout --detach "$UPSTREAM_REV"
+git -C "$tmp" config user.name 'WorkPods Rebase'
+git -C "$tmp" config user.email 'build@workpods.invalid'
+git -C "$tmp" am "$BUZZ_ACP_DIR"/patches/*.patch
+git -C "$tmp" rebase --onto "$base" "$UPSTREAM_REV"
+
+(cd "$tmp" && cargo test --locked -p buzz-acp && cargo build --locked --release -p buzz-acp -p buzz-cli)
+git -C "$tmp" format-patch --no-signature -o "$output" "$base..HEAD"
+printf 'Rebased patches are ready for review at %s\n' "$output"

@@ -4,4 +4,6 @@
 .env.*
 *.env
 !*.env.example
-
+buzz-acp/dist/
+buzz-acp/dist.tmp.*/
+buzz-acp/rebased-patches.*/

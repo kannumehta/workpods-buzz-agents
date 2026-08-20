@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BUZZ_ACP_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd -- "$BUZZ_ACP_DIR/.." && pwd)"
+
+# shellcheck source=../UPSTREAM
+source "$BUZZ_ACP_DIR/UPSTREAM"
+
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null
+  docker_cmd=(sudo -n docker)
+fi
+
+tmp="$BUZZ_ACP_DIR/dist.tmp.$$"
+old="$BUZZ_ACP_DIR/dist.old.$$"
+tag="workpods/buzz-artifacts:build-$$"
+container=""
+cleanup() {
+  if [[ -n "$container" ]]; then
+    "${docker_cmd[@]}" rm -f "$container" >/dev/null 2>&1 || true
+  fi
+  "${docker_cmd[@]}" image rm "$tag" >/dev/null 2>&1 || true
+  rm -rf -- "$tmp" "$old"
+}
+trap cleanup EXIT
+
+"${docker_cmd[@]}" build \
+  --file "$BUZZ_ACP_DIR/Dockerfile.build" \
+  --build-arg "UPSTREAM_URL=$UPSTREAM_URL" \
+  --build-arg "UPSTREAM_REV=$UPSTREAM_REV" \
+  --build-arg "PATCH_HEAD=$PATCH_HEAD" \
+  --build-arg "PATCH_TREE=$PATCH_TREE" \
+  --build-arg "RUST_IMAGE=$RUST_IMAGE" \
+  --build-arg "RUST_TOOLCHAIN=$RUST_TOOLCHAIN" \
+  --tag "$tag" \
+  "$REPO_ROOT"
+
+mkdir -p "$tmp"
+container="$("${docker_cmd[@]}" create "$tag" /bin/true)"
+for artifact in buzz buzz-acp SHA256SUMS provenance.json; do
+  "${docker_cmd[@]}" cp "$container:/$artifact" "$tmp/$artifact"
+done
+if [[ ! -O "$tmp/buzz" ]]; then
+  sudo -n chown -R "$(id -u):$(id -g)" "$tmp"
+fi
+"${docker_cmd[@]}" rm "$container" >/dev/null
+container=""
+"${docker_cmd[@]}" image rm "$tag" >/dev/null
+
+test -x "$tmp/buzz"
+test -x "$tmp/buzz-acp"
+test -s "$tmp/provenance.json"
+(cd "$tmp" && sha256sum -c SHA256SUMS)
+
+if [[ -e "$BUZZ_ACP_DIR/dist" ]]; then
+  mv -- "$BUZZ_ACP_DIR/dist" "$old"
+fi
+mv -- "$tmp" "$BUZZ_ACP_DIR/dist"
+rm -rf -- "$old"
+trap - EXIT
+printf 'Built pinned Buzz artifacts in %s\n' "$BUZZ_ACP_DIR/dist"
