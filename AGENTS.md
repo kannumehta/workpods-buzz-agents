@@ -85,6 +85,14 @@ state. Building and validation must not invoke `docker compose up`.
 Use `pods/scripts/build-image`; direct Docker builds may consume stale ignored
 Buzz artifacts. Compose intentionally has no build stanza. Before cutover,
 `pods/scripts/predeploy` must pass with `WORKPODS_ROLLBACK_ARCHIVE_ROOT` set to
-the checksum-verified cold archive. It also enforces six regular, non-symlink
-identity files with mode `0600`. Follow `pods/DEPLOY.md` for recovery; never
-delete a damaged ACP session mapping to make a restart succeed.
+the checksum-verified cold archive on a different filesystem. It also enforces
+six regular, non-symlink identity files and six seeded Codex auth stores, all
+owned by UID/GID 10000 with mode `0600`. `pods/scripts/validate` fetches the
+pinned public Hermes source into a temporary checkout unless an explicit
+`HERMES_SOURCE_WORKTREE` is supplied. Follow `pods/DEPLOY.md` as the only
+executable migration and recovery runbook; never delete a damaged ACP session
+mapping to make a restart succeed.
+
+Buzz `relay_url` and `cli_path` live in the image-owned Hermes YAML. Compose
+does not duplicate them. If an operator explicitly adds `BUZZ_RELAY_URL` or
+`BUZZ_CLI_PATH`, Hermes gives that non-empty environment value precedence.

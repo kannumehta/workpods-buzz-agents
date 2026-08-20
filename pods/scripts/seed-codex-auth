@@ -8,9 +8,21 @@ fi
 
 state_root=$(realpath "$1")
 image=$2
+codex_auth_file=${WORKPODS_CODEX_AUTH_FILE:-/home/ubuntu/.codex/auth.json}
+requested_auth_file=$codex_auth_file
+if ! codex_auth_file=$(realpath -e "$codex_auth_file"); then
+  echo "Missing Codex auth file: $requested_auth_file" >&2
+  exit 66
+fi
 
-if [[ ! -r /home/ubuntu/.codex/auth.json ]]; then
-  echo "Missing readable /home/ubuntu/.codex/auth.json" >&2
+docker_cmd=(docker)
+if ! docker info >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null
+  docker_cmd=(sudo -n docker)
+fi
+
+if [[ ! -r "$codex_auth_file" ]]; then
+  echo "Missing readable Codex auth file: $codex_auth_file" >&2
   exit 66
 fi
 
@@ -25,11 +37,14 @@ homes=(
 
 for home in "${homes[@]}"; do
   target="$state_root/$home"
-  [[ -d "$target" ]] || { echo "Missing state home: $target" >&2; exit 66; }
-  docker run --rm \
+  if [[ ! -d "$target" ]] && ! sudo -n test -d "$target"; then
+    echo "Missing state home: $target" >&2
+    exit 66
+  fi
+  "${docker_cmd[@]}" run --rm \
     --entrypoint /bin/sh \
     -v "$target:/opt/data" \
-    -v /home/ubuntu/.codex:/codex-host:ro \
+    -v "$codex_auth_file:/codex-host/auth.json:ro" \
     -e HERMES_HOME=/opt/data \
     -e HOME=/opt/data/home \
     -e CODEX_HOME=/codex-host \
@@ -42,7 +57,17 @@ from hermes_cli.auth import _save_codex_tokens
 payload = json.loads(Path("/codex-host/auth.json").read_text(encoding="utf-8"))
 _save_codex_tokens(payload["tokens"], payload.get("last_refresh"), label="host-codex")
 PY
-/opt/hermes/.venv/bin/hermes auth status openai-codex >/dev/null'
+chown 10000:10000 /opt/data/auth.json /opt/data/auth.lock
+chmod 0600 /opt/data/auth.json /opt/data/auth.lock'
+
+  "${docker_cmd[@]}" run --rm \
+    --user 10000:10000 \
+    --entrypoint /opt/hermes/.venv/bin/hermes \
+    -v "$target:/opt/data" \
+    -e HERMES_HOME=/opt/data \
+    -e HOME=/opt/data/home \
+    "$image" \
+    auth status openai-codex >/dev/null
 done
 
 echo "Seeded Codex auth into six staged Hermes identity homes"
