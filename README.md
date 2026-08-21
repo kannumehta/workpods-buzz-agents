@@ -141,7 +141,9 @@ Populate the secret files by migrating the current files; never paste key
 values into Git.
 `llm-gateway.env` uses `OPENAI_API_KEY` for the WorkPods gateway client token,
 not an OpenAI credential, and must set `OPENAI_BASE_URL` to the internal gateway
-`/v1` endpoint. Active Hermes state must not contain `auth.json`; archive any
-legacy direct-provider credentials before deployment. The cold rollback image
-and archived state remain available for an explicit rollback, but running pods
+`/v1` endpoint. Hermes may persist non-secret `openai-api` credential-pool
+metadata in active `auth.json` files; `predeploy` permits only metadata owned by
+the Hermes user and pointing at that gateway endpoint. Archive any legacy
+direct-provider credentials before deployment. The cold rollback image and
+archived state remain available for an explicit rollback, but running pods
 authenticate only to the gateway.

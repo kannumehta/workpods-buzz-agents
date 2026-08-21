@@ -11,6 +11,7 @@ fi
 
 python3 pods/tests/test-config.py
 pods/tests/test-bootstrap.sh
+pods/tests/test-auth-state.sh
 
 compose_cmd=(env WORKPODS_BUILD_REVISION=validation docker compose)
 gateway_env="$repo_root/../.runtime/secrets/hermes-pods/llm-gateway.env"

@@ -120,17 +120,11 @@ if [[ ! -d "$state_root" ]]; then
   printf 'Hermes state root is missing: %s\n' "$state_root" >&2
   exit 1
 fi
-find_cmd=(find)
-if ! find "$state_root" -name auth.json -print -quit >/dev/null 2>&1; then
-  find_cmd=(sudo -n find)
+auth_validator=("$repo_root/pods/scripts/validate-auth-state")
+if [[ ! -r "$state_root" || ! -r "$gateway_env" ]]; then
+  auth_validator=(sudo -n "$repo_root/pods/scripts/validate-auth-state")
 fi
-auth_files=$("${find_cmd[@]}" "$state_root" -name auth.json -print)
-while IFS= read -r auth_file; do
-  [[ -n "$auth_file" ]] || continue
-  printf 'direct provider auth must be archived before gateway-only deployment: %s\n' \
-    "$auth_file" >&2
-  exit 1
-done <<<"$auth_files"
+"${auth_validator[@]}" "$state_root" "$gateway_env"
 
 docker_cmd=(docker)
 if ! docker info >/dev/null 2>&1; then

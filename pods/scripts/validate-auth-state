@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Validate that active Hermes auth files contain gateway metadata only."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+ALLOWED_TOP_LEVEL = {"version", "providers", "credential_pool", "updated_at"}
+ALLOWED_ENTRY_FIELDS = {
+    "id",
+    "label",
+    "auth_type",
+    "priority",
+    "source",
+    "last_status",
+    "last_status_at",
+    "last_error_code",
+    "last_error_reason",
+    "last_error_message",
+    "last_error_reset_at",
+    "base_url",
+    "request_count",
+    "secret_fingerprint",
+}
+
+
+def fail(path: Path, reason: str) -> None:
+    raise ValueError(f"unsafe active auth metadata: {path}: {reason}")
+
+
+def read_single_env_value(path: Path, key: str) -> str:
+    matches = [
+        line.removeprefix(f"{key}=")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith(f"{key}=")
+    ]
+    if len(matches) != 1 or not matches[0]:
+        raise ValueError(f"{path} must define {key} exactly once")
+    return matches[0]
+
+
+def auth_files(root: Path) -> list[Path]:
+    found: list[Path] = []
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        dirs[:] = [name for name in dirs if not (current_path / name).is_symlink()]
+        if "auth.json" in files:
+            found.append(current_path / "auth.json")
+    return sorted(found)
+
+
+def validate(path: Path, gateway_url: str) -> None:
+    if path.is_symlink():
+        fail(path, "symlinks are not allowed")
+    metadata = path.stat()
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        fail(path, "mode must be 0600")
+    if (metadata.st_uid, metadata.st_gid) != (10000, 10000):
+        fail(path, "owner must be 10000:10000")
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        fail(path, f"unreadable or invalid JSON ({type(exc).__name__})")
+    if not isinstance(data, dict) or set(data) != ALLOWED_TOP_LEVEL:
+        fail(path, "unexpected top-level fields")
+    if data.get("providers") != {}:
+        fail(path, "direct provider auth is not allowed")
+    pool = data.get("credential_pool")
+    if not isinstance(pool, dict) or set(pool) != {"openai-api"}:
+        fail(path, "only the openai-api gateway pool is allowed")
+    entries = pool["openai-api"]
+    if not isinstance(entries, list) or len(entries) != 1:
+        fail(path, "the gateway pool must contain exactly one entry")
+    entry = entries[0]
+    if not isinstance(entry, dict) or set(entry) != ALLOWED_ENTRY_FIELDS:
+        fail(path, "unexpected gateway credential metadata fields")
+    expected = {
+        "label": "OPENAI_API_KEY",
+        "auth_type": "api_key",
+        "source": "env:OPENAI_API_KEY",
+        "base_url": gateway_url,
+    }
+    if any(entry.get(key) != value for key, value in expected.items()):
+        fail(path, "credential metadata does not describe the WorkPods gateway")
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: validate-auth-state STATE_ROOT GATEWAY_ENV", file=sys.stderr)
+        return 64
+    root, gateway_env = map(Path, sys.argv[1:])
+    gateway_url = read_single_env_value(gateway_env, "OPENAI_BASE_URL")
+    paths = auth_files(root)
+    for path in paths:
+        validate(path, gateway_url)
+    print(f"validated {len(paths)} gateway-only auth metadata files")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from exc

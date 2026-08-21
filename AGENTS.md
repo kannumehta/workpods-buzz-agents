@@ -90,5 +90,7 @@ identity files with mode `0600`. The four multiplexed internal profile files
 must repeat the exact gateway token and base URL from `llm-gateway.env` because
 Hermes makes the routed profile secret scope authoritative and will not borrow
 provider credentials from the container environment. Follow `pods/DEPLOY.md`
-for recovery; never delete a damaged ACP session mapping to make a restart
+for recovery. Active `auth.json` files may contain Hermes' non-secret gateway
+pool metadata only; `predeploy` validates the full shape and rejects direct
+provider state. Never delete a damaged ACP session mapping to make a restart
 succeed.

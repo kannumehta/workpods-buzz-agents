@@ -70,8 +70,7 @@ def main() -> None:
     assert "OPENAI_BASE_URL" in predeploy
     assert "read_single_assignment" in predeploy
     assert "internal_identities" in predeploy
-    assert "direct provider auth must be archived" in predeploy
-    assert 'auth_files=$("${find_cmd[@]}"' in predeploy
+    assert "validate-auth-state" in predeploy
     assert not (PODS / "scripts/seed-codex-auth").exists()
 
 
