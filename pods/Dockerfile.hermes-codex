@@ -5,12 +5,6 @@ ARG BUZZ_PATCH_HEAD=unknown
 ARG BUZZ_PATCH_TREE=unknown
 
 USER root
-RUN npm pack https://registry.npmjs.org/@openai/codex/-/codex-0.147.0.tgz --pack-destination /tmp >/dev/null \
-    && node -e 'const fs=require("fs"),c=require("crypto"); const p="/tmp/openai-codex-0.147.0.tgz"; const h=c.createHash("sha512").update(fs.readFileSync(p)).digest("base64"); if(h!=="EQLEXecAG2ptxI7UpBMo2TR/ga5596/c/OsYF/0LoUDh5JANZ7IoGqlzBEWbuEVQ76JePIbtTW/ihCkp1a7Z3w==") process.exit(1)' \
-    && npm install --global /tmp/openai-codex-0.147.0.tgz \
-    && rm -f /tmp/openai-codex-0.147.0.tgz \
-    && codex --version | grep -F '0.147.0'
-
 COPY buzz-acp/dist/buzz /usr/local/bin/buzz
 COPY buzz-acp/dist/SHA256SUMS /tmp/buzz-SHA256SUMS
 COPY buzz-acp/dist/provenance.json /opt/workpods/buzz-build-provenance.json

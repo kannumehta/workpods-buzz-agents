@@ -28,6 +28,7 @@ if [[ -z "$umbrella" ]]; then
 fi
 
 secret_root="$umbrella/.runtime/secrets/hermes-pods"
+state_root="$umbrella/.runtime/state/hermes-pods"
 identities=(
   content-pod.env
   geo-pod.env
@@ -35,6 +36,12 @@ identities=(
   performance-pod.env
   marketing-pod.env
   support-desk-pod.env
+)
+internal_identities=(
+  content-pod.env
+  geo-pod.env
+  lifecycle-pod.env
+  performance-pod.env
 )
 for identity in "${identities[@]}"; do
   path="$secret_root/$identity"
@@ -53,6 +60,71 @@ for identity in "${identities[@]}"; do
     exit 1
   fi
 done
+
+gateway_env="$secret_root/llm-gateway.env"
+if [[ ! -f "$gateway_env" || -L "$gateway_env" ]]; then
+  printf 'gateway credentials must be a regular non-symlink file: %s\n' "$gateway_env" >&2
+  exit 1
+fi
+gateway_mode=$(stat -c '%a' "$gateway_env")
+gateway_owner=$(stat -c '%u:%g' "$gateway_env")
+if [[ "$gateway_mode" != 600 || "$gateway_owner" != 10000:10000 ]]; then
+  printf 'gateway credentials must be 0600 and owned by 10000:10000: %s (found %s %s)\n' \
+    "$gateway_env" "$gateway_mode" "$gateway_owner" >&2
+  exit 1
+fi
+grep_cmd=(grep)
+if [[ ! -r "$gateway_env" ]]; then
+  grep_cmd=(sudo -n grep)
+fi
+for required in OPENAI_API_KEY OPENAI_BASE_URL; do
+  if ! "${grep_cmd[@]}" -Eq "^${required}=.+" "$gateway_env"; then
+    printf 'gateway credentials are missing %s: %s\n' "$required" "$gateway_env" >&2
+    exit 1
+  fi
+done
+
+read_single_assignment() {
+  local path=$1 key=$2
+  local awk_cmd=(awk)
+  if [[ ! -r "$path" ]]; then
+    awk_cmd=(sudo -n awk)
+  fi
+  "${awk_cmd[@]}" -v key="$key" '
+    index($0, key "=") == 1 { count += 1; line = $0 }
+    END {
+      if (count != 1 || line == key "=") exit 1
+      print line
+    }
+  ' "$path"
+}
+
+# Multiplexed turns fail closed on the routed profile's secret scope. They do
+# not borrow provider credentials from the container environment, so each
+# internal profile must carry the same gateway endpoint and client token as
+# llm-gateway.env.
+for identity in "${internal_identities[@]}"; do
+  path="$secret_root/$identity"
+  for required in OPENAI_API_KEY OPENAI_BASE_URL; do
+    if ! cmp -s \
+      <(read_single_assignment "$gateway_env" "$required") \
+      <(read_single_assignment "$path" "$required"); then
+      printf '%s must define the same %s as llm-gateway.env\n' \
+        "$path" "$required" >&2
+      exit 1
+    fi
+  done
+done
+
+if [[ ! -d "$state_root" ]]; then
+  printf 'Hermes state root is missing: %s\n' "$state_root" >&2
+  exit 1
+fi
+auth_validator=("$repo_root/pods/scripts/validate-auth-state")
+if [[ ! -r "$state_root" || ! -r "$gateway_env" ]]; then
+  auth_validator=(sudo -n "$repo_root/pods/scripts/validate-auth-state")
+fi
+"${auth_validator[@]}" "$state_root" "$gateway_env"
 
 docker_cmd=(docker)
 if ! docker info >/dev/null 2>&1; then

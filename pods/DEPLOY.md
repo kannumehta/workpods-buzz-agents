@@ -18,13 +18,27 @@ WORKPODS_ROLLBACK_ARCHIVE_ROOT="$COLD_ARCHIVE_ROOT" ./pods/scripts/predeploy
 Copy the rollback tar and checksum to storage on a different filesystem before
 cutover. `predeploy` rejects a missing checksum, missing revision image, missing
 rollback tag, dirty checkout, or any missing, symlinked, or non-`0600` identity
-file. Identity env files are bind-mounted into Hermes profile homes, so they
-must be owned by the container identity:
+file. It rejects direct-provider `auth.json` state. Hermes may create a mode-600
+`auth.json` containing only non-secret credential-pool metadata for the WorkPods
+gateway; the gate validates its complete shape, ownership, source, and base URL
+instead of treating it as upstream authentication. Archive legacy direct
+provider credentials outside the mounted state before the gateway-only cutover.
+Identity env files are bind-mounted into Hermes profile homes, so they must be
+owned by the container identity:
 
 ```bash
 sudo chown 10000:10000 "$UMBRELLA/.runtime/secrets/hermes-pods/"*-pod.env
 sudo chmod 600 "$UMBRELLA/.runtime/secrets/hermes-pods/"*-pod.env
 ```
+
+The internal container multiplexes four profiles in one process. Hermes treats
+each routed profile's `.env` as the authoritative secret scope and deliberately
+does not borrow provider credentials from the container environment. Therefore
+`content-pod.env`, `geo-pod.env`, `lifecycle-pod.env`, and
+`performance-pod.env` must each contain the same `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` assignments as `llm-gateway.env`. `predeploy` compares these
+assignments without printing them and fails closed on a missing, duplicate, or
+different value.
 
 Take the separately specified ACP session dump immediately before the ACP binary
 is ever replaced; Hermes deployment does not replace that binary.

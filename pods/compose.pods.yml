@@ -6,7 +6,6 @@ x-hermes-agent: &hermes-agent
   environment: &hermes-environment
     HERMES_HOME: /opt/data
     HOME: /opt/data/home
-    CODEX_HOME: /opt/data/home/.codex
     HERMES_GATEWAY_BOOTSTRAP_STATE: running
     BUZZ_RELAY_URL: https://beta-buzz.workpods.ai
     BUZZ_CLI_PATH: /usr/local/bin/buzz
@@ -28,6 +27,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-internal-workpods
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/composio.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
@@ -48,6 +49,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-marketing-pod
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/composio.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
@@ -64,6 +67,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-support-desk-pod
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/support-desk-pod.env

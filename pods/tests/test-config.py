@@ -17,6 +17,12 @@ CONFIGS = [
 def main() -> None:
     for path in CONFIGS:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert config["model"] == {
+            "provider": "openai-api",
+            "default": "openai-codex/pods/gpt-5.5",
+            "base_url": "http://workpods-llm-gateway:8080/v1",
+            "api_mode": "codex_responses",
+        }, path
         assert config["agent"]["disabled_toolsets"] == ["skills"], path
         assert config["curator"]["enabled"] is False, path
         assert config["kanban"]["dispatch_in_gateway"] is False, path
@@ -43,6 +49,29 @@ def main() -> None:
     assert "9119" not in compose
     assert "email-management" not in compose
     assert "WORKPODS_BUILD_REVISION:?" in compose
+    assert ".runtime/secrets/hermes-pods/llm-gateway.env" in compose
+    assert "CODEX_HOME" not in compose
+
+    dockerfile = (PODS / "Dockerfile.hermes-codex").read_text(encoding="utf-8")
+    assert "@openai/codex" not in dockerfile
+    assert "codex --version" not in dockerfile
+
+    gateway_env = (PODS / "env/llm-gateway.env.example").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in gateway_env
+    assert "OPENAI_BASE_URL=http://workpods-llm-gateway:8080/v1" in gateway_env
+    for profile in ("content", "geo", "lifecycle", "performance"):
+        profile_env = (PODS / f"env/{profile}-pod.env.example").read_text(
+            encoding="utf-8"
+        )
+        assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in profile_env
+        assert "OPENAI_BASE_URL=http://workpods-llm-gateway:8080/v1" in profile_env
+
+    predeploy = (PODS / "scripts/predeploy").read_text(encoding="utf-8")
+    assert "OPENAI_BASE_URL" in predeploy
+    assert "read_single_assignment" in predeploy
+    assert "internal_identities" in predeploy
+    assert "validate-auth-state" in predeploy
+    assert not (PODS / "scripts/seed-codex-auth").exists()
 
 
 if __name__ == "__main__":
