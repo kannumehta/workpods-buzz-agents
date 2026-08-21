@@ -28,6 +28,7 @@ if [[ -z "$umbrella" ]]; then
 fi
 
 secret_root="$umbrella/.runtime/secrets/hermes-pods"
+state_root="$umbrella/.runtime/state/hermes-pods"
 identities=(
   content-pod.env
   geo-pod.env
@@ -53,6 +54,43 @@ for identity in "${identities[@]}"; do
     exit 1
   fi
 done
+
+gateway_env="$secret_root/llm-gateway.env"
+if [[ ! -f "$gateway_env" || -L "$gateway_env" ]]; then
+  printf 'gateway credentials must be a regular non-symlink file: %s\n' "$gateway_env" >&2
+  exit 1
+fi
+gateway_mode=$(stat -c '%a' "$gateway_env")
+gateway_owner=$(stat -c '%u:%g' "$gateway_env")
+if [[ "$gateway_mode" != 600 || "$gateway_owner" != 10000:10000 ]]; then
+  printf 'gateway credentials must be 0600 and owned by 10000:10000: %s (found %s %s)\n' \
+    "$gateway_env" "$gateway_mode" "$gateway_owner" >&2
+  exit 1
+fi
+for required in OPENAI_API_KEY OPENAI_BASE_URL; do
+  if ! grep -Eq "^${required}=.+" "$gateway_env"; then
+    printf 'gateway credentials are missing %s: %s\n' "$required" "$gateway_env" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -d "$state_root" ]]; then
+  printf 'Hermes state root is missing: %s\n' "$state_root" >&2
+  exit 1
+fi
+while IFS= read -r -d '' auth_file; do
+  if [[ -L "$auth_file" ]]; then
+    printf 'Hermes auth state must not be a symlink: %s\n' "$auth_file" >&2
+    exit 1
+  fi
+  mode=$(stat -c '%a' "$auth_file")
+  owner=$(stat -c '%u:%g' "$auth_file")
+  if [[ "$mode" != 600 || "$owner" != 10000:10000 ]]; then
+    printf 'Hermes auth state must be 0600 and owned by 10000:10000: %s (found %s %s)\n' \
+      "$auth_file" "$mode" "$owner" >&2
+    exit 1
+  fi
+done < <(find "$state_root" -name auth.json -print0)
 
 docker_cmd=(docker)
 if ! docker info >/dev/null 2>&1; then

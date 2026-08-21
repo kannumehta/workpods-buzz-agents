@@ -42,6 +42,8 @@ from hermes_cli.auth import _save_codex_tokens
 payload = json.loads(Path("/codex-host/auth.json").read_text(encoding="utf-8"))
 _save_codex_tokens(payload["tokens"], payload.get("last_refresh"), label="host-codex")
 PY
+chown 10000:10000 /opt/data/auth.json
+chmod 0600 /opt/data/auth.json
 /opt/hermes/.venv/bin/hermes auth status openai-codex >/dev/null'
 done
 

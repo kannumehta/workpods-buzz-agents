@@ -51,6 +51,17 @@ def main() -> None:
     assert "WORKPODS_BUILD_REVISION:?" in compose
     assert ".runtime/secrets/hermes-pods/llm-gateway.env" in compose
 
+    gateway_env = (PODS / "env/llm-gateway.env.example").read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in gateway_env
+    assert "OPENAI_BASE_URL=http://workpods-llm-gateway:8080/v1" in gateway_env
+
+    predeploy = (PODS / "scripts/predeploy").read_text(encoding="utf-8")
+    assert "OPENAI_BASE_URL" in predeploy
+    assert "Hermes auth state must be 0600 and owned by 10000:10000" in predeploy
+
+    seed = (PODS / "scripts/seed-codex-auth").read_text(encoding="utf-8")
+    assert "chown 10000:10000 /opt/data/auth.json" in seed
+
 
 if __name__ == "__main__":
     main()

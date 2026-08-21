@@ -135,3 +135,7 @@ Secret examples under `pods/env/` map to
 `.runtime/secrets/hermes-pods/`. The four internal identity files are mounted
 read-only at `profiles/<name>/.env` inside the internal state tree. Populate the
 secret files by migrating the current files; never paste key values into Git.
+`llm-gateway.env` uses `OPENAI_API_KEY` for the WorkPods gateway client token,
+not an OpenAI credential, and must set `OPENAI_BASE_URL` to the internal gateway
+`/v1` endpoint. `predeploy` also rejects auth state that the Hermes UID cannot
+read, even while the direct Codex credential remains available for rollback.
