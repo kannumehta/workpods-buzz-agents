@@ -12,8 +12,12 @@ fi
 python3 pods/tests/test-config.py
 pods/tests/test-bootstrap.sh
 
-WORKPODS_BUILD_REVISION=validation docker compose \
-  -f pods/compose.pods.yml config --quiet
+compose_cmd=(env WORKPODS_BUILD_REVISION=validation docker compose)
+gateway_env="$repo_root/../.runtime/secrets/hermes-pods/llm-gateway.env"
+if [[ "${docker_cmd[0]}" == sudo || ! -r "$gateway_env" ]]; then
+  compose_cmd=(sudo -n env WORKPODS_BUILD_REVISION=validation docker compose)
+fi
+"${compose_cmd[@]}" -f pods/compose.pods.yml config --quiet
 
 tmp=$(mktemp -d)
 cleanup() {

@@ -6,7 +6,6 @@ x-hermes-agent: &hermes-agent
   environment: &hermes-environment
     HERMES_HOME: /opt/data
     HOME: /opt/data/home
-    CODEX_HOME: /opt/data/home/.codex
     HERMES_GATEWAY_BOOTSTRAP_STATE: running
     BUZZ_RELAY_URL: https://beta-buzz.workpods.ai
     BUZZ_CLI_PATH: /usr/local/bin/buzz

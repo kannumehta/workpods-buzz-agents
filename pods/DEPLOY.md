@@ -18,8 +18,10 @@ WORKPODS_ROLLBACK_ARCHIVE_ROOT="$COLD_ARCHIVE_ROOT" ./pods/scripts/predeploy
 Copy the rollback tar and checksum to storage on a different filesystem before
 cutover. `predeploy` rejects a missing checksum, missing revision image, missing
 rollback tag, dirty checkout, or any missing, symlinked, or non-`0600` identity
-file. Identity env files are bind-mounted into Hermes profile homes, so they
-must be owned by the container identity:
+file. It also rejects active `auth.json` files: archive legacy direct-provider
+credentials outside the mounted state before the gateway-only cutover. Identity
+env files are bind-mounted into Hermes profile homes, so they must be owned by
+the container identity:
 
 ```bash
 sudo chown 10000:10000 "$UMBRELLA/.runtime/secrets/hermes-pods/"*-pod.env

@@ -79,17 +79,9 @@ if [[ ! -d "$state_root" ]]; then
   exit 1
 fi
 while IFS= read -r -d '' auth_file; do
-  if [[ -L "$auth_file" ]]; then
-    printf 'Hermes auth state must not be a symlink: %s\n' "$auth_file" >&2
-    exit 1
-  fi
-  mode=$(stat -c '%a' "$auth_file")
-  owner=$(stat -c '%u:%g' "$auth_file")
-  if [[ "$mode" != 600 || "$owner" != 10000:10000 ]]; then
-    printf 'Hermes auth state must be 0600 and owned by 10000:10000: %s (found %s %s)\n' \
-      "$auth_file" "$mode" "$owner" >&2
-    exit 1
-  fi
+  printf 'direct provider auth must be archived before gateway-only deployment: %s\n' \
+    "$auth_file" >&2
+  exit 1
 done < <(find "$state_root" -name auth.json -print0)
 
 docker_cmd=(docker)

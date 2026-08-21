@@ -19,7 +19,7 @@ def main() -> None:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
         assert config["model"] == {
             "provider": "openai-api",
-            "default": "openai-codex/gpt-5.5",
+            "default": "openai-codex/pods/gpt-5.5",
             "base_url": "http://workpods-llm-gateway:8080/v1",
             "api_mode": "codex_responses",
         }, path
@@ -50,6 +50,11 @@ def main() -> None:
     assert "email-management" not in compose
     assert "WORKPODS_BUILD_REVISION:?" in compose
     assert ".runtime/secrets/hermes-pods/llm-gateway.env" in compose
+    assert "CODEX_HOME" not in compose
+
+    dockerfile = (PODS / "Dockerfile.hermes-codex").read_text(encoding="utf-8")
+    assert "@openai/codex" not in dockerfile
+    assert "codex --version" not in dockerfile
 
     gateway_env = (PODS / "env/llm-gateway.env.example").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in gateway_env
@@ -57,10 +62,8 @@ def main() -> None:
 
     predeploy = (PODS / "scripts/predeploy").read_text(encoding="utf-8")
     assert "OPENAI_BASE_URL" in predeploy
-    assert "Hermes auth state must be 0600 and owned by 10000:10000" in predeploy
-
-    seed = (PODS / "scripts/seed-codex-auth").read_text(encoding="utf-8")
-    assert "chown 10000:10000 /opt/data/auth.json" in seed
+    assert "direct provider auth must be archived" in predeploy
+    assert not (PODS / "scripts/seed-codex-auth").exists()
 
 
 if __name__ == "__main__":

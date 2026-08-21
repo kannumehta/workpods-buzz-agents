@@ -2,7 +2,7 @@ _config_version: 33
 
 model:
   provider: openai-api
-  default: openai-codex/gpt-5.5
+  default: openai-codex/pods/gpt-5.5
   base_url: http://workpods-llm-gateway:8080/v1
   api_mode: codex_responses
 

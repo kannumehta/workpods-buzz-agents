@@ -137,5 +137,7 @@ read-only at `profiles/<name>/.env` inside the internal state tree. Populate the
 secret files by migrating the current files; never paste key values into Git.
 `llm-gateway.env` uses `OPENAI_API_KEY` for the WorkPods gateway client token,
 not an OpenAI credential, and must set `OPENAI_BASE_URL` to the internal gateway
-`/v1` endpoint. `predeploy` also rejects auth state that the Hermes UID cannot
-read, even while the direct Codex credential remains available for rollback.
+`/v1` endpoint. Active Hermes state must not contain `auth.json`; archive any
+legacy direct-provider credentials before deployment. The cold rollback image
+and archived state remain available for an explicit rollback, but running pods
+authenticate only to the gateway.
