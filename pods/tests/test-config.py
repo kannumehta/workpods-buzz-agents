@@ -17,6 +17,12 @@ CONFIGS = [
 def main() -> None:
     for path in CONFIGS:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert config["model"] == {
+            "provider": "openai-api",
+            "default": "openai-codex/gpt-5.5",
+            "base_url": "http://workpods-llm-gateway:8080/v1",
+            "api_mode": "codex_responses",
+        }, path
         assert config["agent"]["disabled_toolsets"] == ["skills"], path
         assert config["curator"]["enabled"] is False, path
         assert config["kanban"]["dispatch_in_gateway"] is False, path
@@ -43,6 +49,7 @@ def main() -> None:
     assert "9119" not in compose
     assert "email-management" not in compose
     assert "WORKPODS_BUILD_REVISION:?" in compose
+    assert ".runtime/secrets/hermes-pods/llm-gateway.env" in compose
 
 
 if __name__ == "__main__":

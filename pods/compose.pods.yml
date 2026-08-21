@@ -28,6 +28,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-internal-workpods
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/composio.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
@@ -48,6 +50,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-marketing-pod
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/composio.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
@@ -64,6 +68,8 @@ services:
     <<: *hermes-agent
     container_name: hermes-support-desk-pod
     env_file:
+      - path: ../../.runtime/secrets/hermes-pods/llm-gateway.env
+        required: false
       - path: ../../.runtime/secrets/hermes-pods/workpods-mcp.env
         required: false
       - path: ../../.runtime/secrets/hermes-pods/support-desk-pod.env
