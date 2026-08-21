@@ -67,8 +67,12 @@ if [[ "$gateway_mode" != 600 || "$gateway_owner" != 10000:10000 ]]; then
     "$gateway_env" "$gateway_mode" "$gateway_owner" >&2
   exit 1
 fi
+grep_cmd=(grep)
+if [[ ! -r "$gateway_env" ]]; then
+  grep_cmd=(sudo -n grep)
+fi
 for required in OPENAI_API_KEY OPENAI_BASE_URL; do
-  if ! grep -Eq "^${required}=.+" "$gateway_env"; then
+  if ! "${grep_cmd[@]}" -Eq "^${required}=.+" "$gateway_env"; then
     printf 'gateway credentials are missing %s: %s\n' "$required" "$gateway_env" >&2
     exit 1
   fi
