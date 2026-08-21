@@ -59,9 +59,17 @@ def main() -> None:
     gateway_env = (PODS / "env/llm-gateway.env.example").read_text(encoding="utf-8")
     assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in gateway_env
     assert "OPENAI_BASE_URL=http://workpods-llm-gateway:8080/v1" in gateway_env
+    for profile in ("content", "geo", "lifecycle", "performance"):
+        profile_env = (PODS / f"env/{profile}-pod.env.example").read_text(
+            encoding="utf-8"
+        )
+        assert "OPENAI_API_KEY=REPLACE_WITH_HERMES_GATEWAY_TOKEN" in profile_env
+        assert "OPENAI_BASE_URL=http://workpods-llm-gateway:8080/v1" in profile_env
 
     predeploy = (PODS / "scripts/predeploy").read_text(encoding="utf-8")
     assert "OPENAI_BASE_URL" in predeploy
+    assert "read_single_assignment" in predeploy
+    assert "internal_identities" in predeploy
     assert "direct provider auth must be archived" in predeploy
     assert 'auth_files=$("${find_cmd[@]}"' in predeploy
     assert not (PODS / "scripts/seed-codex-auth").exists()

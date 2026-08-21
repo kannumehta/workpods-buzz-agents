@@ -37,6 +37,12 @@ identities=(
   marketing-pod.env
   support-desk-pod.env
 )
+internal_identities=(
+  content-pod.env
+  geo-pod.env
+  lifecycle-pod.env
+  performance-pod.env
+)
 for identity in "${identities[@]}"; do
   path="$secret_root/$identity"
   if [[ ! -f "$path" || -L "$path" ]]; then
@@ -76,6 +82,38 @@ for required in OPENAI_API_KEY OPENAI_BASE_URL; do
     printf 'gateway credentials are missing %s: %s\n' "$required" "$gateway_env" >&2
     exit 1
   fi
+done
+
+read_single_assignment() {
+  local path=$1 key=$2
+  local awk_cmd=(awk)
+  if [[ ! -r "$path" ]]; then
+    awk_cmd=(sudo -n awk)
+  fi
+  "${awk_cmd[@]}" -v key="$key" '
+    index($0, key "=") == 1 { count += 1; line = $0 }
+    END {
+      if (count != 1 || line == key "=") exit 1
+      print line
+    }
+  ' "$path"
+}
+
+# Multiplexed turns fail closed on the routed profile's secret scope. They do
+# not borrow provider credentials from the container environment, so each
+# internal profile must carry the same gateway endpoint and client token as
+# llm-gateway.env.
+for identity in "${internal_identities[@]}"; do
+  path="$secret_root/$identity"
+  for required in OPENAI_API_KEY OPENAI_BASE_URL; do
+    if ! cmp -s \
+      <(read_single_assignment "$gateway_env" "$required") \
+      <(read_single_assignment "$path" "$required"); then
+      printf '%s must define the same %s as llm-gateway.env\n' \
+        "$path" "$required" >&2
+      exit 1
+    fi
+  done
 done
 
 if [[ ! -d "$state_root" ]]; then

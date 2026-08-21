@@ -28,6 +28,15 @@ sudo chown 10000:10000 "$UMBRELLA/.runtime/secrets/hermes-pods/"*-pod.env
 sudo chmod 600 "$UMBRELLA/.runtime/secrets/hermes-pods/"*-pod.env
 ```
 
+The internal container multiplexes four profiles in one process. Hermes treats
+each routed profile's `.env` as the authoritative secret scope and deliberately
+does not borrow provider credentials from the container environment. Therefore
+`content-pod.env`, `geo-pod.env`, `lifecycle-pod.env`, and
+`performance-pod.env` must each contain the same `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` assignments as `llm-gateway.env`. `predeploy` compares these
+assignments without printing them and fails closed on a missing, duplicate, or
+different value.
+
 Take the separately specified ACP session dump immediately before the ACP binary
 is ever replaced; Hermes deployment does not replace that binary.
 
